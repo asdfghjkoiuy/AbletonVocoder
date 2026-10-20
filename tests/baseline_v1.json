@@ -1,0 +1,701 @@
+{
+  "plugin": "AbletonVocoder_v1.jsfx",
+  "v1": true,
+  "sample_rate": 48000,
+  "block": 512,
+  "ysfx_commit": "5c3452fee62583aa3d1b7e877d0c758c4024af89",
+  "summary": {
+    "PASS": 3,
+    "FAIL": 10,
+    "N/A": 1
+  },
+  "aborted": false,
+  "tests": [
+    {
+      "id": "V0",
+      "title": "Metric self-check",
+      "status": "PASS",
+      "seconds": 0.406,
+      "error": "",
+      "metrics": [
+        {
+          "name": "self_pure_sine_dbc",
+          "value": -147.71480702302202,
+          "threshold": "<= -45",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_harmonic_dbc",
+          "value": -19.999999999999282,
+          "threshold": "-25 .. -15",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_slope_error_db_per_oct",
+          "value": 1.7763568394002505e-15,
+          "threshold": "|x| <= 0.05",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_flat_ripple_db",
+          "value": 0.0,
+          "threshold": "<= 0.01",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_tilt_error_db_per_oct",
+          "value": -0.00019081226558315123,
+          "threshold": "|x| <= 0.15",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_shift_error_st",
+          "value": 0.12213402524812178,
+          "threshold": "|x| <= 0.2",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_audio_shift_error_st",
+          "value": -0.017853338284024467,
+          "threshold": "|x| <= 1",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_audio_shift_corr",
+          "value": 0.9521763779362916,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "self_yin_sine_cents",
+          "value": 0.016578844406851704,
+          "threshold": "<= 2",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_yin_voiced_frames",
+          "value": 318.0,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "self_yin_voice_median_cents",
+          "value": 4.905152087162494,
+          "threshold": "<= 20",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_yin_voice_octave_pct",
+          "value": 0.31446540880503143,
+          "threshold": "<= 1",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_passthrough_ripple_1_3_db",
+          "value": 3.3250044295448034e-08,
+          "threshold": "<= 0.2",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_passthrough_ripple_1_12_db",
+          "value": 6.09417055181381e-08,
+          "threshold": "<= 0.5",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_passthrough_ratio_median_db",
+          "value": -3.9131781781642925e-10,
+          "threshold": "|x| <= 0.2",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "self_zero_peak",
+          "value": 0.0,
+          "threshold": "<= 0",
+          "status": "PASS",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T1",
+      "title": "Filterbank flatness",
+      "status": "FAIL",
+      "seconds": 3.635,
+      "error": "",
+      "metrics": [
+        {
+          "name": "precise_output_rms_dbfs",
+          "value": -55.01986484808129,
+          "threshold": ">= -60",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "ripple_1_3_oct_db",
+          "value": 19.493577705904613,
+          "threshold": "<= 2",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "precise_ratio_median_db",
+          "value": -48.14436562091774,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "ripple_1_12_oct_db",
+          "value": 24.93453746186288,
+          "threshold": "<= 6",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "retro_tilt_db_per_oct",
+          "value": 1.9318355912195888,
+          "threshold": "info",
+          "status": "INFO",
+          "note": "expect positive"
+        }
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "Envelope ripple",
+      "status": "PASS",
+      "seconds": 0.727,
+      "error": "",
+      "metrics": [
+        {
+          "name": "distortion_dbc",
+          "value": -59.478069214800925,
+          "threshold": "<= -40",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "distortion_fast_env_dbc",
+          "value": -41.32658090400257,
+          "threshold": "info",
+          "status": "INFO",
+          "note": "attack 0.5 / release 10"
+        }
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "Enhance tilt",
+      "status": "FAIL",
+      "seconds": 1.465,
+      "error": "",
+      "metrics": [
+        {
+          "name": "slope_off_db_per_oct",
+          "value": -2.1125419599904873,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "slope_on_db_per_oct",
+          "value": -0.035945801465435696,
+          "threshold": "|x| <= 1",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "slope_improvement_db_per_oct",
+          "value": 2.0765961585250516,
+          "threshold": ">= 3",
+          "status": "FAIL",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "Resynthesis",
+      "status": "FAIL",
+      "seconds": 0.913,
+      "error": "",
+      "metrics": [
+        {
+          "name": "rms_delta_db",
+          "value": -21.64649628130353,
+          "threshold": "|x| <= 1.5",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "spectrum_diff_std_db",
+          "value": 9.633987138521109,
+          "threshold": "<= 2.5",
+          "status": "FAIL",
+          "note": "1/3-oct mean-PSD, 100 Hz\u20138 kHz, bands within 40 dB of the input peak"
+        }
+      ]
+    },
+    {
+      "id": "T5",
+      "title": "Level vs bands",
+      "status": "FAIL",
+      "seconds": 3.192,
+      "error": "",
+      "metrics": [
+        {
+          "name": "rms_dbfs_8bands",
+          "value": -41.75502918139378,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_dbfs_12bands",
+          "value": -51.69853326372064,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_dbfs_16bands",
+          "value": -56.06019438774476,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_dbfs_20bands",
+          "value": -63.75793977591311,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_dbfs_24bands",
+          "value": -65.31826669030336,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_dbfs_28bands",
+          "value": -68.44676426573754,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_dbfs_32bands",
+          "value": -70.35823066984273,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "rms_spread_db",
+          "value": 28.603201488448946,
+          "threshold": "<= 2",
+          "status": "FAIL",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T6",
+      "title": "Gate",
+      "status": "PASS",
+      "seconds": 2.934,
+      "error": "",
+      "metrics": [
+        {
+          "name": "pause_rms_dbfs",
+          "value": -96.56767787546087,
+          "threshold": "<= -80",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "speech_vs_gate_off_db",
+          "value": -0.5380157870505187,
+          "threshold": "|x| <= 3",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "speech_gate_on_dbfs",
+          "value": -64.38916815588875,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "speech_gate_off_dbfs",
+          "value": -63.851152368838235,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T7",
+      "title": "Unvoiced",
+      "status": "FAIL",
+      "seconds": 2.953,
+      "error": "",
+      "metrics": [
+        {
+          "name": "fricative_frames",
+          "value": 52.0,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "voiced_frames",
+          "value": 130.0,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "fricative_hf_improvement_db",
+          "value": 71.98364380852277,
+          "threshold": ">= 10",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "voiced_hf_change_db",
+          "value": 56.26824659231533,
+          "threshold": "|x| <= 3",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "contrast_delta_db",
+          "value": 15.71539721620745,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "sens0_residual_db",
+          "value": 36.04100140098488,
+          "threshold": "<= -60",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "sens100_voiced_hf_increase_db",
+          "value": 80.08963041121588,
+          "threshold": ">= 6",
+          "status": "PASS",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T8",
+      "title": "Pitch tracking",
+      "status": "FAIL",
+      "seconds": 1.675,
+      "error": "",
+      "metrics": [
+        {
+          "name": "voiced_frames",
+          "value": 318.0,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "median_abs_cents",
+          "value": 2086.592731501992,
+          "threshold": "<= 25",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "octave_error_pct",
+          "value": 100.0,
+          "threshold": "<= 2",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "gap_rms_dbfs",
+          "value": -103.50576109838507,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "gap_hold_median_abs_cents",
+          "value": 1107.820916873175,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "speech_jump_gt_600_pct",
+          "value": 8.239700374531836,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T9",
+      "title": "Channel modes",
+      "status": "FAIL",
+      "seconds": 1.636,
+      "error": "",
+      "metrics": [
+        {
+          "name": "lr_right_rms_dbfs",
+          "value": -69.81652405180714,
+          "threshold": "<= -80",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "lr_left_rms_dbfs",
+          "value": -69.69996788769339,
+          "threshold": ">= -40",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "stereo_l_rms_dbfs",
+          "value": -71.37024799280431,
+          "threshold": ">= -40",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "stereo_r_rms_dbfs",
+          "value": -71.37423056692323,
+          "threshold": ">= -40",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "stereo_lr_correlation",
+          "value": 0.015253013114217076,
+          "threshold": "<= 0.5",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "stereo_lr_correlation_signed",
+          "value": 0.015253013114217076,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "mono_max_abs_diff",
+          "value": 0.0,
+          "threshold": "<= 1e-06",
+          "status": "PASS",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T10",
+      "title": "Robustness",
+      "status": "FAIL",
+      "seconds": 6.529,
+      "error": "",
+      "metrics": [
+        {
+          "name": "silence_peak_44100",
+          "value": 1.9746326529457292e-07,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "square_peak_dbfs_44100",
+          "value": -41.6907,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "silence_peak_48000",
+          "value": 1.6739137720378494e-07,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "square_peak_dbfs_48000",
+          "value": -40.9658,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "silence_peak_96000",
+          "value": 1.5822328691683651e-07,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "square_peak_dbfs_96000",
+          "value": -43.057,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "silence_peak_abs",
+          "value": 1.9746326529457292e-07,
+          "threshold": "<= 1e-09",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "silence_nan_inf",
+          "value": 0,
+          "threshold": "== 0",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "square_peak_dbfs",
+          "value": -40.9658,
+          "threshold": "<= 12",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "square_nan_inf",
+          "value": 0,
+          "threshold": "== 0",
+          "status": "PASS",
+          "note": ""
+        },
+        {
+          "name": "auto_peak_dbfs",
+          "value": 22.755,
+          "threshold": "<= 12",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "click_ref",
+          "value": 0.003227690664061811,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "click_auto",
+          "value": 15.459896802902222,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "click_ratio",
+          "value": 4789.77027601743,
+          "threshold": "<= 4",
+          "status": "FAIL",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T11",
+      "title": "CPU",
+      "status": "FAIL",
+      "seconds": 1.115,
+      "error": "",
+      "metrics": [
+        {
+          "name": "realtime_factor",
+          "value": 3.676854,
+          "threshold": ">= 10",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "wall_s",
+          "value": 1.087887,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        },
+        {
+          "name": "bands",
+          "value": 32.0,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T12",
+      "title": "Formant",
+      "status": "FAIL",
+      "seconds": 1.82,
+      "error": "",
+      "metrics": [
+        {
+          "name": "formant_shift_st",
+          "value": 0.0,
+          "threshold": "5.5 .. 8.5",
+          "status": "FAIL",
+          "note": ""
+        },
+        {
+          "name": "formant_corr",
+          "value": 0.9999999999999999,
+          "threshold": "info",
+          "status": "INFO",
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "T13",
+      "title": "Noise carrier",
+      "status": "N/A",
+      "seconds": 0.002,
+      "error": "v1 has no Noise Rate / Noise Crackle",
+      "metrics": [
+        {
+          "name": "feature",
+          "value": null,
+          "threshold": "n/a",
+          "status": "NA",
+          "note": "v1 has no Noise Rate / Noise Crackle"
+        }
+      ]
+    }
+  ]
+}
