@@ -493,12 +493,18 @@ def _envelope_shape(env):
     return np.diff(env)
 
 
-def measure_shift_st(env_ref, env_mov, step_st, max_st=18.0) -> tuple[float, float]:
-    """Return (shift, correlation). Positive means env_mov sits higher in frequency."""
-    ref = _envelope_shape(env_ref)
-    mov = _envelope_shape(env_mov)
-    ref = ref - np.nanmean(ref)
-    mov = mov - np.nanmean(mov)
+def _corr_shift(ref, mov, step_st, max_st=18.0, per_lag_mean=False) -> tuple[float, float]:
+    """Lag of maximum correlation. Positive means mov sits higher in frequency.
+
+    per_lag_mean subtracts the mean of each overlapping pair. A sloping
+    spectrum otherwise matches best at a short lag, because the fixed
+    window's tilt dominates the full-vector mean.
+    """
+    ref = np.asarray(ref, dtype=np.float64)
+    mov = np.asarray(mov, dtype=np.float64)
+    if not per_lag_mean:
+        ref = ref - np.nanmean(ref)
+        mov = mov - np.nanmean(mov)
     max_bins = int(round(max_st / step_st))
     lags = np.arange(-max_bins, max_bins + 1)
     scores = np.full(lags.shape, -np.inf)
@@ -514,6 +520,9 @@ def measure_shift_st(env_ref, env_mov, step_st, max_st=18.0) -> tuple[float, flo
         if int(np.count_nonzero(m)) < 8:
             continue
         aa, bb = a[m], b[m]
+        if per_lag_mean:
+            aa = aa - np.mean(aa)
+            bb = bb - np.mean(bb)
         denom = float(np.linalg.norm(aa) * np.linalg.norm(bb))
         if denom > 0:
             scores[i] = float(np.dot(aa, bb) / denom)
@@ -525,6 +534,48 @@ def measure_shift_st(env_ref, env_mov, step_st, max_st=18.0) -> tuple[float, flo
         if denom != 0:
             delta = 0.5 * (y0 - y2) / denom
     return float((lags[i] + delta) * step_st), float(scores[i])
+
+
+def measure_shift_st(env_ref, env_mov, step_st, max_st=18.0) -> tuple[float, float]:
+    """Derivative cross-correlation. Positive means env_mov sits higher."""
+    return _corr_shift(_envelope_shape(env_ref), _envelope_shape(env_mov), step_st, max_st)
+
+
+def coarse_log_db(x, sr, fmin=300.0, fmax=6000.0, step_st=0.25, sigma_oct=0.5):
+    """Long-term log spectrum, Gaussian-smoothed along log frequency.
+
+    The kernel is applied on a grid that extends four standard deviations
+    past the requested edges, then cropped, so the ends are not pulled
+    toward zero. sigma_oct is the Gaussian width in octaves.
+    """
+    pad = 4.0 * sigma_oct
+    f_lo = fmin / 2.0 ** pad
+    f_hi = min(fmax * 2.0 ** pad, sr * 0.49)
+    f, p = welch_psd(x, sr, nperseg=8192)
+    f = f[1:]
+    db = 10.0 * np.log10(p[1:] + 1e-30)
+    semis = np.arange(math.log2(f_lo) * 12.0, math.log2(f_hi) * 12.0, step_st)
+    freqs = 2.0 ** (semis / 12.0)
+    grid = np.interp(np.log(freqs), np.log(f), db)
+    sigma_bins = sigma_oct * 12.0 / step_st
+    radius = max(1, int(math.ceil(4.0 * sigma_bins)))
+    xk = np.arange(-radius, radius + 1, dtype=np.float64)
+    ker = np.exp(-0.5 * (xk / sigma_bins) ** 2)
+    ker /= np.sum(ker)
+    smooth = np.convolve(grid, ker, mode="same")
+    keep = (freqs >= fmin * 0.999) & (freqs <= fmax * 1.001)
+    return semis[keep], smooth[keep]
+
+
+def measure_coarse_shift_st(x_ref, x_mov, sr, step_st=0.25) -> tuple[float, float]:
+    """Cross-correlation of half-octave-smoothed log spectra, not derivatives.
+
+    Each lag is mean-centred on its overlap. A single mean over the whole
+    band would lock a sloping spectrum to a short lag.
+    """
+    _s0, e0 = coarse_log_db(x_ref, sr, step_st=step_st)
+    _s1, e1 = coarse_log_db(x_mov, sr, step_st=step_st)
+    return _corr_shift(e0, e1, step_st, per_lag_mean=True)
 
 
 def shift_spectrum(x, semitones):
@@ -1056,17 +1107,19 @@ def test_t12(ctx):
     metrics.append(m_info("formant_corr", corr))
     metrics.append(m_info("formant_corr_down", corr_dn))
 
-    # Carrier=Modulator + Enhance. Constant-pitch speech leaves a harmonic
-    # comb in the long-term spectrum, and the shape correlator locks onto
-    # that comb (the pitch must stay put). The synthetic voice glides
-    # 100→300 Hz, so the harmonics smear. 40 bands: a 7 st move then spans
-    # several bands. v1's band slider stops at 32.
+    # Carrier=Modulator + Enhance, on the gliding synthetic voice, 40 bands.
+    # Overlapping bands move the coarse envelope and leave sub-band carrier
+    # detail where it was, so the derivative correlator stays near lag 0.
+    # The pass criterion is the half-octave-smoothed log spectrum itself.
+    # v1's band slider stops at 32.
     if ctx.v1:
         for name in (
-            "formant_shift_modulator_st",
-            "formant_shift_modulator_down_st",
-            "formant_corr_modulator",
-            "formant_corr_modulator_down",
+            "formant_coarse_modulator_st",
+            "formant_coarse_modulator_down_st",
+            "formant_deriv_modulator_st",
+            "formant_deriv_modulator_down_st",
+            "formant_coarse_voice_ext_st",
+            "formant_coarse_voice_ext_down_st",
         ):
             metrics.append(metric(name, None, "n/a", "NA", "v1 has no 40-band setting"))
         return metrics
@@ -1082,15 +1135,35 @@ def test_t12(ctx):
     metrics.extend(nan_fail(mm0))
     metrics.extend(nan_fail(mm7))
     metrics.extend(nan_fail(mmm))
+    coarse_up, _cc_up = measure_coarse_shift_st(ym0, ym7, sr)
+    coarse_dn, _cc_dn = measure_coarse_shift_st(ym0, ymm, sr)
+    metrics.append(m_ge("formant_coarse_modulator_st", coarse_up, 3.5))
+    metrics.append(m_le("formant_coarse_modulator_down_st", coarse_dn, -3.5))
     _a, em0 = envelope_db(ym0, sr)
     _b, em7 = envelope_db(ym7, sr)
     _c, emm = envelope_db(ymm, sr)
-    shift_m, corr_m = measure_shift_st(em0, em7, 0.25)
-    shift_md, corr_md = measure_shift_st(em0, emm, 0.25)
-    metrics.append(m_between("formant_shift_modulator_st", shift_m, 7.0 - 2.0, 7.0 + 2.0))
-    metrics.append(m_between("formant_shift_modulator_down_st", shift_md, -7.0 - 2.0, -7.0 + 2.0))
-    metrics.append(m_info("formant_corr_modulator", corr_m))
-    metrics.append(m_info("formant_corr_modulator_down", corr_md))
+    deriv_up, _corr_up = measure_shift_st(em0, em7, 0.25)
+    deriv_dn, _corr_dn = measure_shift_st(em0, emm, 0.25)
+    metrics.append(m_info("formant_deriv_modulator_st", deriv_up))
+    metrics.append(m_info("formant_deriv_modulator_down_st", deriv_dn))
+
+    # Same voice, external white noise: the coarse measure should read about ±7.
+    noise_v = signals.white(len(voice), np.random.default_rng(1201), rms_db=-18.0)
+    ext_v = signals.assemble(voice, voice, noise_v, noise_v)
+    base_e = {
+        "carrier": "external", "enhance": 1, "depth": 100, "drywet": 100,
+        "bands": 40,
+    }
+    ye0, me0 = render(ctx, ext_v, dict(base_e, formant=0), "t12_vext0")
+    ye7, me7 = render(ctx, ext_v, dict(base_e, formant=7), "t12_vext7")
+    yem, mem = render(ctx, ext_v, dict(base_e, formant=-7), "t12_vextm7")
+    metrics.extend(nan_fail(me0))
+    metrics.extend(nan_fail(me7))
+    metrics.extend(nan_fail(mem))
+    ext_up, _eu = measure_coarse_shift_st(ye0, ye7, sr)
+    ext_dn, _ed = measure_coarse_shift_st(ye0, yem, sr)
+    metrics.append(m_info("formant_coarse_voice_ext_st", ext_up))
+    metrics.append(m_info("formant_coarse_voice_ext_down_st", ext_dn))
     return metrics
 
 

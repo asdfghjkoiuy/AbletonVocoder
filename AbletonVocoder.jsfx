@@ -134,11 +134,19 @@ INV_SQRT2 = 0.7071067811865476;
 //   the envelope, so formants, a saw's tilt, and the release tail stay.
 //
 // Enhance on:
-//   the carrier band is scaled to NOMINAL (cap ENH_CAP, and the carrier
-//   level used for that scale is held at ENH_FLOOR = -80 dBFS when the
-//   carrier band is quieter than that), then
-//   gain = (env / NOMINAL) ^ (Depth/100).
-//   At Depth 100% the NOMINALs cancel and the band output tracks env.
+//   the carrier band is divided by its own amplitude, then scaled by the
+//   analysis envelope. At Depth 100% the NOMINALs cancel and the band
+//   output tracks env.
+//   The divisor may sit up to 60 dB below this sample's loudest carrier
+//   band, and never below -100 dBFS. Quieter than that, the band gain
+//   fades to 0 across a 12 dB knee (smoothstep on the log level) so a
+//   noise floor is not boosted and the gain has no step. There is no
+//   fixed 32x cap on content inside the window. The carrier-level
+//   smoother attacks in 4 ms and releases in 15 ms.
+//   GAIN_CAP = 32 bounds env/NOMINAL. It binds only when one band's
+//   amplitude envelope exceeds 1.6 (+4.1 dBFS). On ordinary material,
+//   including the -18 dBFS synth voice, it does not trigger. It is a
+//   safety clamp, not part of the Enhance curve.
 //   Enhance off and on are crossfaded. They are not stacked.
 //   The TRIM_* gain is not applied while Enhance is on.
 DENS_EXP = 1;
@@ -147,8 +155,10 @@ INV_REF_DENS = 1 / REF_LIN;
 NOMINAL = 0.05;
 INV_REF_ENH = 1 / NOMINAL;
 GAIN_CAP = 32;
-ENH_CAP = 32;
-ENH_FLOOR = exp(-80 * DB2A);
+ENH_REL = exp(-60 * DB2A);
+ENH_ABS = exp(-100 * DB2A);
+ENH_KNEE = exp(12 * DB2A);
+ENH_KNEE_LOG = 12 * DB2A;
 // Enhance-off broadband trims. Measured with a -18 dBFS speech modulator,
 // 20 bands, Precise, Depth 100%, Enhance off, so the output lands on the
 // input: noise at default Rate/Crackle, a -18 dBFS saw chord, the speech
@@ -183,6 +193,8 @@ design_sig = -1;
 uv_env = 0;
 formant_sm = 0;
 enh_mix = 0;
+enh_peak = 0;
+enh_seen = 0;
 lvl = 1;
 wet = 1;
 dev = 1;
@@ -568,7 +580,28 @@ function depth_gain(env, inv_vr) local(go, gn, b) global(depth_mode, INV_REF_DEN
   go * (1 - enh_mix) + gn * enh_mix;
 );
 
-function synth_sample(st, x) local(y, yp, hp, rms, boost) global(enh_mix, enh_att, enh_rel, NOMINAL, ENH_FLOOR, ENH_CAP) (
+function enh_boost(rms) local(flo, boost, hi, t, s)
+global(enh_peak, enh_seen, ENH_REL, ENH_ABS, ENH_KNEE, ENH_KNEE_LOG, NOMINAL) (
+  rms > enh_seen ? enh_seen = rms;
+  flo = enh_peak * ENH_REL;
+  flo < ENH_ABS ? flo = ENH_ABS;
+  rms < flo ? (
+    0;
+  ) : (
+    boost = NOMINAL / rms;
+    hi = flo * ENH_KNEE;
+    rms < hi ? (
+      t = log(rms / flo) / ENH_KNEE_LOG;
+      t < 0 ? t = 0;
+      t > 1 ? t = 1;
+      s = t * t * (3 - 2 * t);
+      boost *= s;
+    );
+    boost;
+  );
+);
+
+function synth_sample(st, x) local(y, yp, hp, rms, boost, hi, t, s) global(enh_mix, enh_att, enh_rel, NOMINAL, ENH_ABS, ENH_KNEE, ENH_KNEE_LOG) (
   y = svf2(st, x);
   enh_mix > 0.0005 ? (
     yp = y * y;
@@ -577,9 +610,19 @@ function synth_sample(st, x) local(y, yp, hp, rms, boost) global(enh_mix, enh_at
     hp < 0.000000000000000000000001 ? hp = 0;
     st[7] = hp;
     rms = hp > 0 ? sqrt(hp) : 0;
-    rms < ENH_FLOOR ? rms = ENH_FLOOR;
-    boost = NOMINAL / rms;
-    boost > ENH_CAP ? boost = ENH_CAP;
+    rms < ENH_ABS ? (
+      boost = 0;
+    ) : (
+      boost = NOMINAL / rms;
+      hi = ENH_ABS * ENH_KNEE;
+      rms < hi ? (
+        t = log(rms / ENH_ABS) / ENH_KNEE_LOG;
+        t < 0 ? t = 0;
+        t > 1 ? t = 1;
+        s = t * t * (3 - 2 * t);
+        boost *= s;
+      );
+    );
     y *= (1 - enh_mix + enh_mix * boost);
   );
   y;
@@ -852,7 +895,9 @@ rel_c = 1 - exp(-1 / (max(s_release, 0.2) * 0.001 * srate));
 att_c > 1 ? att_c = 1;
 rel_c > 1 ? rel_c = 1;
 enh_att = 1 - exp(-1 / (0.004 * srate));
-enh_rel = 1 - exp(-1 / (0.050 * srate));
+enh_rel = 1 - exp(-1 / (0.015 * srate));
+enh_pk_att = 1 - exp(-1 / (0.001 * srate));
+enh_pk_rel = 1 - exp(-1 / (0.200 * srate));
 gate_c = 1 - exp(-1 / (0.004 * srate));
 duck_c = 1 - exp(-1 / (0.0035 * srate));
 macro_c = 1 - exp(-1 / (0.008 * srate));
@@ -1047,7 +1092,11 @@ ch_lr = active_ch > 1.5;
 car_same = carL == carR;
 bi = 0;
 fast_share = fast_dry && gate_off && !ch_lr && !do_enh && (ch_mono || car_same) && n_run == n_bands;
-fast_share ? fast_bands() : (
+fast_share ? (
+  fast_bands();
+  enh_peak += enh_pk_rel * (0 - enh_peak);
+) : (
+enh_seen = 0;
 loop(n_run,
   cf = COEF + bi * CSTR;
   bm = cf[20];
@@ -1227,9 +1276,7 @@ loop(n_run,
     p_ep < 0.000000000000000000000001 ? p_ep = 0;
     stS[7] = p_ep;
     p_rms = p_ep > 0 ? sqrt(p_ep) : 0;
-    p_rms < ENH_FLOOR ? p_rms = ENH_FLOOR;
-    p_boost = NOMINAL / p_rms;
-    p_boost > ENH_CAP ? p_boost = ENH_CAP;
+    p_boost = enh_boost(p_rms);
     p_bp *= enh_mix > 0.999 ? p_boost : (1 - enh_mix + enh_mix * p_boost);
   );
   sumL += p_bp * dgL * gLgate * trim;
@@ -1267,14 +1314,17 @@ loop(n_run,
       p_ep < 0.000000000000000000000001 ? p_ep = 0;
       stT[7] = p_ep;
       p_rms = p_ep > 0 ? sqrt(p_ep) : 0;
-      p_rms < ENH_FLOOR ? p_rms = ENH_FLOOR;
-      p_boost = NOMINAL / p_rms;
-      p_boost > ENH_CAP ? p_boost = ENH_CAP;
+      p_boost = enh_boost(p_rms);
       p_bp *= enh_mix > 0.999 ? p_boost : (1 - enh_mix + enh_mix * p_boost);
     );
     sumR += p_bp * dgR * gRgate * trim;
   );
   bi += 1;
+);
+enh_seen > enh_peak ? (
+  enh_peak += enh_pk_att * (enh_seen - enh_peak);
+) : (
+  enh_peak += enh_pk_rel * (enh_seen - enh_peak);
 );
 );
 
