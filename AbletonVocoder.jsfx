@@ -84,7 +84,7 @@ CSTR = 24;
 // lane 2 synthesis L (also mono)
 // lane 3 synthesis R
 //  0 ic1a 1 ic2a 2 ic1b 3 ic2b
-//  4 envelope power (analytic amplitude squared, attack/release smoothed)
+//  4 amplitude envelope (RMS). Attack/Release one-pole is on this, not on power.
 //  5 gate gain
 //  6 gate open (0/1)
 //  7 enhance power (synthesis lanes)
@@ -118,24 +118,55 @@ DB2A = LN10 / 20;
 Q_DEN = sqrt(1 + sqrt(2));        // 4th-order -3 dB Q factor
 INV_SQRT2 = 0.7071067811865476;
 
-// Depth reference, enhance off: white-equivalent band RMS of -18 dBFS -> gain 1.
-// Enhance on: carrier band is normalized to NOMINAL RMS, then multiplied by
-// (env_rms / NOMINAL). The two NOMINALs cancel, so a matched carrier/modulator
-// reconstructs the analysis filterbank (flat sum ~= unity).
-REF_DENS = exp(-18 * DB2A);
-INV_REF_DENS = 1 / REF_DENS;
+// Depth / envelope → band gain.
+// env is the band amplitude after the attack/release one-pole (not power).
+// No envelope floor and no minimum gain: env → 0 forces gain → 0 at every
+// Depth other than 0%. Depth 0% ignores the envelope and uses gain 1.
+//
+// Enhance off:
+//   r = env * inv_sqrt(vr) / REF_LIN
+//   Depth 100% uses r. Other depths use r ^ (Depth/100).
+//   inv_sqrt(vr) is the band's white-noise power gain, so r = 1 (unity)
+//   for a white modulator at REF_LIN = -18 dBFS. A harmonic carrier is
+//   louder than noise under this law, because a partial fills a narrow
+//   band. TRIM_* below is one constant broadband gain per carrier mode
+//   that removes that bias. It is not per-band and it does not move with
+//   the envelope, so formants, a saw's tilt, and the release tail stay.
+//
+// Enhance on:
+//   the carrier band is scaled to NOMINAL (cap ENH_CAP, and the carrier
+//   level used for that scale is held at ENH_FLOOR = -80 dBFS when the
+//   carrier band is quieter than that), then
+//   gain = (env / NOMINAL) ^ (Depth/100).
+//   At Depth 100% the NOMINALs cancel and the band output tracks env.
+//   Enhance off and on are crossfaded. They are not stacked.
+//   The TRIM_* gain is not applied while Enhance is on.
+DENS_EXP = 1;
+REF_LIN = exp(-18 * DB2A);
+INV_REF_DENS = 1 / REF_LIN;
 NOMINAL = 0.05;
 INV_REF_ENH = 1 / NOMINAL;
-GAIN_CAP = 8;
+GAIN_CAP = 32;
 ENH_CAP = 32;
 ENH_FLOOR = exp(-80 * DB2A);
-WHITE_RMS = 0.20;
+// Enhance-off broadband trims. Measured with a -18 dBFS speech modulator,
+// 20 bands, Precise, Depth 100%, Enhance off, so the output lands on the
+// input: noise at default Rate/Crackle, a -18 dBFS saw chord, the speech
+// used as its own carrier, and the pitch-tracking saw. Linear density
+// already tracks the envelope, so these stay constant.
+TRIM_NOISE = 0.6831955045222029;
+TRIM_EXT = 0.11665812717409325;
+TRIM_MOD = 0.05570895346700124;
+TRIM_PITCH = 0.07670081876935099;
 
-// Oscillator scales, each waveform ~ -12 dBFS RMS.
-SAW_SCALE = 0.4330127018922193;
-P50_SCALE = 0.25;
-P25_SCALE = 0.2886751345948129;
-P125_SCALE = 0.3779644730092272;
+// Internal carriers (noise and the pitch oscillator), full-band RMS.
+// -18 dBFS. Uniform[-1,1] and the raw bipolar saw both have RMS 1/sqrt(3).
+WHITE_RMS = 0.12589254117941673;
+NOISE_AMP = 0.21805227761670687;
+SAW_SCALE = 0.21805227761670687;
+P50_SCALE = 0.12589254117941673;
+P25_SCALE = 0.14536818507780461;
+P125_SCALE = 0.19033163193068273;
 
 memset(0, 0, HI + 48 * MAXB);
 
@@ -377,7 +408,7 @@ function solve_flat() local(nfreq, fmin, fmax, log0, log1, fi, bi, freq, idx, sg
   );
 );
 
-function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(srate, flo, fhi, n_bands, bw_pct, retro_on, COEF, CSTR, MAXB, LN2, DB2A) (
+function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(srate, flo, fhi, n_bands, bw_pct, retro_on, COEF, CSTR, MAXB, LN2, DB2A, DENS_EXP) (
   flo < 20 ? flo = 20;
   fhi > srate * 0.45 ? fhi = srate * 0.45;
   fhi < flo * 1.25 ? fhi = min(flo * 1.25, srate * 0.45);
@@ -406,7 +437,10 @@ function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(
       cf[9] = (bi % 2) ? -1 : 1;
       vr = band_vr(fc, qq);
       vr < 0.0000000001 ? vr = 0.0000000001;
-      cf[8] = 1 / sqrt(vr);
+      // DENS_EXP = 1 maps band RMS to white-equivalent level (flat on white).
+      // Lower values reduce the boost on narrow bands, which is where a saw
+      // or a vowel piles up. 1 is the flat-white calibration.
+      cf[8] = exp(DENS_EXP * log(1 / sqrt(vr)));
       cf[21] = fc;
     ) : (
       cf[1] = log(max(flo, 20));
@@ -422,7 +456,7 @@ function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(
   solve_flat();
 );
 
-function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, qq_s, amix, form_ratio) global(o_a1, o_a2, o_a3, o_k, srate, samplesblock, boot, formant_sm, s_formant, LN2, COEF, CSTR, MAXB, n_bands) (
+function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio) global(o_a1, o_a2, o_a3, o_k, srate, samplesblock, boot, formant_sm, s_formant, LN2, COEF, CSTR, MAXB, n_bands) (
   a = 1 - exp(-samplesblock / (0.02 * srate));
   a > 1 ? a = 1;
   boot ? formant_sm = s_formant : (
@@ -453,13 +487,8 @@ function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, qq_s, amix, form_ratio) g
     fcs = fc * form_ratio;
     fcs > srate * 0.45 ? fcs = srate * 0.45;
     fcs < 1 ? fcs = 1;
-    // A pure center shift of only a few semitones still overlaps the original
-    // band (BW 100% is ~5 st wide). Tighten the carrier filters as the shift
-    // grows so the moved slice, not the original carrier spectrum, sets the
-    // output envelope.
-    qq_s = qq * (1 + abs(formant_sm) * 0.40);
-    qq_s > 48 ? qq_s = 48;
-    svf_set(fcs, qq_s);
+    // Formant only slides the carrier centres. Q stays the analysis Q.
+    svf_set(fcs, qq);
     cf[16] = o_a1; cf[17] = o_a2; cf[18] = o_a3; cf[19] = o_k;
     cf[21] = fc;
     bi < n_bands ? 0 : 0;
@@ -491,12 +520,13 @@ global(c_a1, c_a2, c_a3, c_k, env_a2) (
   bp;
 );
 
-function env_follow(st, a2) local(ep) global(att_c, rel_c) (
+function env_follow(st, a2) local(ep, amp) global(att_c, rel_c) (
+  amp = a2 > 0 ? sqrt(a2 * 0.5) : 0;
   ep = st[4];
-  a2 > ep ? (ep += att_c * (a2 - ep);) : (ep += rel_c * (a2 - ep););
-  ep < 0.000000000000000000000001 ? ep = 0;
+  amp > ep ? (ep += att_c * (amp - ep);) : (ep += rel_c * (amp - ep););
+  ep < 0.000000000001 ? ep = 0;
   st[4] = ep;
-  ep > 0 ? sqrt(ep * 0.5) : 0;
+  ep;
 );
 
 function gate_follow(st, env) local(op, gg) global(gate_off, gate_open_th, gate_close_th, gate_c) (
@@ -520,19 +550,14 @@ function depth_gain(env, inv_vr) local(go, gn, b) global(depth_mode, INV_REF_DEN
   depth_mode == 0 ? (
     go = 1;
     gn = 1;
-  ) : depth_mode == 1 ? (
-    go = env * inv_vr * INV_REF_DENS;
-    gn = env * INV_REF_ENH;
   ) : (
-    env < 0.0000000001 ? (
+    env < 0.000000000001 ? (
       go = 0;
       gn = 0;
     ) : (
       b = env * inv_vr * INV_REF_DENS;
-      b < 0.00000001 ? b = 0.00000001;
       go = exp(depth_k * log(b));
       b = env * INV_REF_ENH;
-      b < 0.00000001 ? b = 0.00000001;
       gn = exp(depth_k * log(b));
     );
   );
@@ -668,6 +693,100 @@ function yin_run() local(frame, w, tau_min, tau_max, start, j, tau, xj, xt, s1, 
   );
 );
 
+// Mono modulator, Enhance off, Depth 100%, gate open, one carrier sample.
+// cf[23] is inv_sqrt(vr)/REF_LIN. cf[22] is polarity * flatness * retro * n_trim.
+// Band mix and atten still fade per sample, then snap once they arrive.
+function fast_bands() local(bi, cf, fc_hz, b_a1, b_a2, b_a3, b_k, stA, stS, stT, p_ic1, p_ic2, p_v3, p_v1, p_v2, p_bp, p_a2, p_amp, p_ep, dgL, bm, at)
+global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_c, rel_c, GAIN_CAP, modL, carL, sumL, sumR, DISP_ENV, e_all, e_hi, uv_off, bmix_c, att_sm_c)
+(
+  bi = 0;
+  loop(n_bands,
+    cf = COEF + bi * CSTR;
+    bm = cf[20];
+    abs(bm - 1) < 0.000001 ? bm = 1 : (
+      bm += bmix_c * (1 - bm);
+      cf[20] = bm;
+    );
+    at = cf[10];
+    p_ep = cf[11];
+    abs(at - p_ep) < 0.000001 ? at = p_ep : (
+      at += att_sm_c * (p_ep - at);
+      at < 0.000000000001 ? at = 0;
+      cf[10] = at;
+    );
+    b_a1 = cf[12];
+    b_a2 = cf[13];
+    b_a3 = cf[14];
+    b_k = cf[15];
+    stA = STATE + bi * SSTR;
+    p_ic1 = stA[0];
+    p_ic2 = stA[1];
+    p_v3 = modL - p_ic2;
+    p_v1 = b_a1 * p_ic1 + b_a2 * p_v3;
+    p_v2 = p_ic2 + b_a2 * p_ic1 + b_a3 * p_v3;
+    stA[0] = p_v1 + p_v1 - p_ic1;
+    stA[1] = p_v2 + p_v2 - p_ic2;
+    p_bp = b_k * p_v1;
+    p_ic1 = stA[2];
+    p_ic2 = stA[3];
+    p_v3 = p_bp - p_ic2;
+    p_v1 = b_a1 * p_ic1 + b_a2 * p_v3;
+    p_v2 = p_ic2 + b_a2 * p_ic1 + b_a3 * p_v3;
+    stA[2] = p_v1 + p_v1 - p_ic1;
+    stA[3] = p_v2 + p_v2 - p_ic2;
+    p_bp = b_k * p_v1;
+    p_v3 = b_k * p_v2;
+    p_a2 = p_bp * p_bp + p_v3 * p_v3;
+    p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
+    p_ep = stA[4];
+    p_amp > p_ep ? (p_ep += att_c * (p_amp - p_ep);) : (p_ep += rel_c * (p_amp - p_ep););
+    p_ep < 0.000000000001 ? p_ep = 0;
+    stA[4] = p_ep;
+    uv_off ? 0 : (
+      e_all += p_a2;
+      fc_hz = cf[21];
+      fc_hz >= 4000 ? e_hi += p_a2;
+    );
+    DISP_ENV[bi] = p_ep * cf[11];
+    dgL = p_ep * cf[23];
+    dgL > GAIN_CAP ? dgL = GAIN_CAP;
+    b_a1 = cf[16];
+    b_a2 = cf[17];
+    b_a3 = cf[18];
+    b_k = cf[19];
+    stS = stA + LANE_STEP * 2;
+    p_ic1 = stS[0];
+    p_ic2 = stS[1];
+    p_v3 = carL - p_ic2;
+    p_v1 = b_a1 * p_ic1 + b_a2 * p_v3;
+    p_v2 = p_ic2 + b_a2 * p_ic1 + b_a3 * p_v3;
+    stS[0] = p_v1 + p_v1 - p_ic1;
+    stS[1] = p_v2 + p_v2 - p_ic2;
+    p_bp = b_k * p_v1;
+    p_ic1 = stS[2];
+    p_ic2 = stS[3];
+    p_v3 = p_bp - p_ic2;
+    p_v1 = b_a1 * p_ic1 + b_a2 * p_v3;
+    p_v2 = p_ic2 + b_a2 * p_ic1 + b_a3 * p_v3;
+    stS[2] = p_v1 + p_v1 - p_ic1;
+    stS[3] = p_v2 + p_v2 - p_ic2;
+    p_bp = b_k * p_v1;
+    sumL += p_bp * dgL * cf[22] * at * bm;
+    // Keep the unused right filter in step, so a little unvoiced noise can
+    // wake it without a stale-state blast. Skipped when Unvoiced is off.
+    uv_off ? 0 : (
+      stT = stS + LANE_STEP;
+      stT[0] = stS[0];
+      stT[1] = stS[1];
+      stT[2] = stS[2];
+      stT[3] = stS[3];
+      stT[7] = stS[7];
+    );
+    bi += 1;
+  );
+  sumR = sumL;
+);
+
 @slider
 param_dirty = 1;
 
@@ -710,7 +829,6 @@ boot ? (
     gi += 1;
   );
 );
-boot = 0;
 
 bi = 0;
 loop(MAXB,
@@ -720,9 +838,15 @@ loop(MAXB,
   ad > 0 ? ad = 0;
   BAND_ATT[bi] = ad;
   cf[11] = exp(ad * DB2A);
+  // Band atten starts at its target. A fade from silence here costs the
+  // first pitch frames an octave error.
+  boot ? cf[10] = cf[11];
   bi += 1;
 );
+boot = 0;
 
+// Literal one-pole time constants on the amplitude envelope.
+// Amplitude decays as exp(-t/tau), so 60 dB takes ln(1000)*tau ≈ 6.91*tau.
 att_c = 1 - exp(-1 / (max(s_attack, 0.05) * 0.001 * srate));
 rel_c = 1 - exp(-1 / (max(s_release, 0.2) * 0.001 * srate));
 att_c > 1 ? att_c = 1;
@@ -734,10 +858,10 @@ duck_c = 1 - exp(-1 / (0.0035 * srate));
 macro_c = 1 - exp(-1 / (0.008 * srate));
 bmix_c = 1 - exp(-1 / (0.012 * srate));
 att_sm_c = 1 - exp(-1 / (0.008 * srate));
-// Release is shorter than the attack. A 30 ms hangover still covers the next
-// 20 ms test frame and the power-mean HF metric treats that as a voiced hit.
+// Release is shorter than the attack, and short enough that a fricative
+// does not leave noise in the next 20 ms frame once the modulator HF is gone.
 uv_ms_a = s_uvspeed > 0.5 ? 0.004 : 0.012;
-uv_ms_r = s_uvspeed > 0.5 ? 0.0025 : 0.004;
+uv_ms_r = s_uvspeed > 0.5 ? 0.0025 : 0.0015;
 uv_att = 1 - exp(-1 / (uv_ms_a * srate));
 uv_rel = 1 - exp(-1 / (uv_ms_r * srate));
 glide_c = 1 - exp(-1 / (0.0025 * srate));
@@ -805,9 +929,18 @@ n_run = n_bands;
 bi = n_bands;
 while (bi < MAXB && (COEF + bi * CSTR)[20] > 0.001) (bi += 1;);
 n_run = bi;
-// Coherent-sum normalization is slightly quieter as bands are added.
-// 0.40 dB per octave of (N/20) keeps speech+saw RMS within the T5 window.
-n_trim = exp(0.40 * log(n_bands / 20) / LN2 * DB2A);
+// Fewer, wider bands of a harmonic carrier sum a bit quieter. -0.40 dB
+// per octave of (N/20) keeps a saw-chord vocode inside 2 dB from 4 to 40
+// bands. 20 bands is unity, so the TRIM_* levels are unchanged.
+n_trim = exp(-0.40 * log(n_bands / 20) / LN2 * DB2A);
+bi = 0;
+loop(n_bands,
+  cf = COEF + bi * CSTR;
+  // Steady trim, and the white-equivalent envelope scale. Fast path only.
+  cf[22] = cf[9] * cf[6] * cf[4] * n_trim;
+  cf[23] = cf[8] * INV_REF_DENS;
+  bi += 1;
+);
 
 @sample
 duck += duck_c * (duck_target - duck);
@@ -827,8 +960,8 @@ active_carrier == 0 ? (
   sh_pos >= hold_n ? (
     sh_pos -= hold_n;
     s_ncrack >= 0.999 ? (
-      sh_l = (rand(2) - 1) * 0.3464101615;
-      sh_r = (rand(2) - 1) * 0.3464101615;
+      sh_l = (rand(2) - 1) * NOISE_AMP;
+      sh_r = (rand(2) - 1) * NOISE_AMP;
     ) : (
       crack_p = s_ncrack * s_ncrack;
       crack_p = crack_p * crack_p;
@@ -891,7 +1024,9 @@ uv_amp = 0;
 uv_off ? (
   uv_env = 0;
 ) : (
-  uv_amp = uv_env * uv_lin * 0.17;
+  // 0 dB on the Unvoiced slider. A little above the -18 dBFS carrier,
+  // so fricatives read as noise and vowels do not.
+  uv_amp = uv_env * uv_lin * 0.18;
 );
 uv_amp > 0.00000001 ? (
   carL += (rand(2) - 1) * uv_amp;
@@ -908,7 +1043,11 @@ fast_dry = depth_mode > 0.5 && depth_mode < 1.5 && enh_mix < 0.001;
 do_enh = enh_mix > 0.0005;
 ch_mono = active_ch < 0.5;
 ch_lr = active_ch > 1.5;
+// Same carrier sample on both pins: one synthesis filter, two gains.
+car_same = carL == carR;
 bi = 0;
+fast_share = fast_dry && gate_off && !ch_lr && !do_enh && (ch_mono || car_same) && n_run == n_bands;
+fast_share ? fast_bands() : (
 loop(n_run,
   cf = COEF + bi * CSTR;
   bm = cf[20];
@@ -946,11 +1085,12 @@ loop(n_run,
   p_bp = b_k * p_v1;
   p_v3 = b_k * p_v2;
   p_a2 = p_bp * p_bp + p_v3 * p_v3;
+  p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
   p_ep = stA[4];
-  p_a2 > p_ep ? (p_ep += att_c * (p_a2 - p_ep);) : (p_ep += rel_c * (p_a2 - p_ep););
-  p_ep < 0.000000000000000000000001 ? p_ep = 0;
+  p_amp > p_ep ? (p_ep += att_c * (p_amp - p_ep);) : (p_ep += rel_c * (p_amp - p_ep););
+  p_ep < 0.000000000001 ? p_ep = 0;
   stA[4] = p_ep;
-  envL = p_ep > 0 ? sqrt(p_ep * 0.5) : 0;
+  envL = p_ep;
   // Instantaneous band power for the unvoiced ratio. The synthesis envelope
   // release is up to 450 ms, which would still read "fricative" through the
   // next vowel. The decision itself is smoothed later (Slow/Fast).
@@ -994,11 +1134,12 @@ loop(n_run,
     p_bp = b_k * p_v1;
     p_v3 = b_k * p_v2;
     p_a2 = p_bp * p_bp + p_v3 * p_v3;
+    p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
     p_ep = stB[4];
-    p_a2 > p_ep ? (p_ep += att_c * (p_a2 - p_ep);) : (p_ep += rel_c * (p_a2 - p_ep););
-    p_ep < 0.000000000000000000000001 ? p_ep = 0;
+    p_amp > p_ep ? (p_ep += att_c * (p_amp - p_ep);) : (p_ep += rel_c * (p_amp - p_ep););
+    p_ep < 0.000000000001 ? p_ep = 0;
     stB[4] = p_ep;
-    envR = p_ep > 0 ? sqrt(p_ep * 0.5) : 0;
+    envR = p_ep;
     instR = p_a2;
     gate_off ? (
       p_gg = stB[5];
@@ -1043,6 +1184,7 @@ loop(n_run,
       dgR = dgL;
     );
   ) : fast_dry ? (
+    // Unity at white-equivalent -18 dBFS. env == 0 already yields 0.
     dgL = envL * invr * INV_REF_DENS;
     dgL > GAIN_CAP ? dgL = GAIN_CAP;
     ch_lr ? (
@@ -1092,7 +1234,15 @@ loop(n_run,
   );
   sumL += p_bp * dgL * gLgate * trim;
 
-  ch_mono ? 0 : (
+  ch_mono ? 0 : car_same ? (
+    sumR += p_bp * dgR * gRgate * trim;
+    stT = stS + LANE_STEP;
+    stT[0] = stS[0];
+    stT[1] = stS[1];
+    stT[2] = stS[2];
+    stT[3] = stS[3];
+    stT[7] = stS[7];
+  ) : (
     stT = stS + LANE_STEP;
     p_ic1 = stT[0];
     p_ic2 = stT[1];
@@ -1125,6 +1275,7 @@ loop(n_run,
     sumR += p_bp * dgR * gRgate * trim;
   );
   bi += 1;
+);
 );
 
 bi = n_run;
@@ -1161,6 +1312,25 @@ uv_off ? (
   uv_env < 0.000001 ? uv_env = 0;
 );
 
+// Constant broadband trim for Enhance off. Depth 0% stays at unity.
+// Enhance on is already calibrated, so the trim fades out with enh_mix.
+unity_dg ? (
+  p_b = 1;
+) : active_carrier < 0.5 ? (
+  p_b = TRIM_NOISE;
+) : active_carrier < 1.5 ? (
+  p_b = TRIM_EXT;
+) : active_carrier < 2.5 ? (
+  p_b = TRIM_MOD;
+) : (
+  p_b = TRIM_PITCH;
+);
+unity_dg ? 0 : (
+  p_b = enh_mix + (1 - enh_mix) * p_b;
+);
+sumL *= p_b;
+ch_mono ? 0 : sumR *= p_b;
+
 active_ch == 0 ? (
   dryL = modL;
   dryR = modL;
@@ -1175,30 +1345,6 @@ procL = (dryL * (1 - wet) + sumL * wet) * lvl;
 procR = (dryR * (1 - wet) + sumR * wet) * lvl;
 spl0 = procL * dev * duck + dryL * (1 - dev * duck);
 spl1 = procR * dev * duck + dryR * (1 - dev * duck);
-// Smooth ceiling near +11 dBFS. Unity gain and unity slope below +6 dBFS,
-// so speech-level tests are untouched while full-scale carriers and
-// Level automation cannot run away.
-pk = abs(spl0);
-pk > 2 ? (
-  sgn = spl0 > 0 ? 1 : -1;
-  u = (pk - 2) / 1.5;
-  spl0 = sgn * (2 + 1.5 * u / (1 + u));
-);
-pk = abs(spl1);
-pk > 2 ? (
-  sgn = spl1 > 0 ? 1 : -1;
-  u = (pk - 2) / 1.5;
-  spl1 = sgn * (2 + 1.5 * u / (1 + u));
-);
-// Cap the sample-to-sample step. Loud dry noise at Level +24 is still a
-// legal signal; this only removes the extreme second differences the
-// automation stress test treats as clicks. Slope stays 1 below the cap.
-dlt = spl0 - sl0;
-dlt > 2.2 ? dlt = 2.2 : dlt < -2.2 ? dlt = -2.2;
-spl0 = sl0 + dlt;
-dlt = spl1 - sl1;
-dlt > 2.2 ? dlt = 2.2 : dlt < -2.2 ? dlt = -2.2;
-spl1 = sl1 + dlt;
 
 spl0 != spl0 ? spl0 = 0;
 spl1 != spl1 ? spl1 = 0;
@@ -1206,8 +1352,6 @@ abs(spl0) > 100000000 ? spl0 = 0;
 abs(spl1) > 100000000 ? spl1 = 0;
 abs(spl0) < 0.000000000000001 ? spl0 = 0;
 abs(spl1) < 0.000000000000001 ? spl1 = 0;
-sl0 = spl0;
-sl1 = spl1;
 
 // Pitch tracker: decimate the mono modulator, analyze when a hop is ready.
 active_carrier == 3 ? (

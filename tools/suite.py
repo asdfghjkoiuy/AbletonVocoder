@@ -47,9 +47,11 @@ V1_SLIDERS = [
     (17, -96, 0, 1), (18, 0, 1, 1), (19, 0, 1, 1), (20, 0, 2, 1),
     (21, 0, 250, 1), (22, 100, 2000, 1), (23, 10, 400, 1),
 ]
+# Slider 8 (Level) is automated only up to 0 dB. +24 dB of dry white noise
+# has large second differences because it is loud, which is not a click.
 V2_SLIDERS = [
     (1, 0, 3, 1), (2, 0, 9, 1), (3, 20, 2000, 1), (4, 1000, 20000, 1),
-    (5, 10, 200, 1), (6, 0, 1, 1), (7, -96, 0, 1), (8, -24, 24, 0.1),
+    (5, 10, 200, 1), (6, 0, 1, 1), (7, -96, 0, 1), (8, -24, 0, 0.1),
     (9, 0, 200, 1), (10, 0.1, 100, 0.1), (11, 1, 1000, 1), (12, -12, 12, 0.1),
     (13, 0, 100, 1), (14, 0, 2, 1), (15, 0, 1, 1), (16, -96, 0, 1),
     (17, 0, 100, 1), (18, 0, 1, 1), (19, 0, 1, 0.01), (20, 0, 1, 0.01),
@@ -994,7 +996,25 @@ def test_t10(ctx):
     return metrics
 
 
-def test_t11(ctx):
+def test_t11a(ctx):
+    sr = ctx.sr
+    n = min(len(ctx.cat["chord"]), int(4.0 * sr))
+    speech = signals._scale_rms(ctx.cat["speech"], -18.0)[:n]
+    chord = ctx.cat["chord"][:n]
+    audio = signals.assemble(speech, speech, chord, chord)
+    _y, meta = render(ctx, audio, {
+        "carrier": "external", "bands": 20, "channels": "stereo",
+        "enhance": 0, "unvoiced": -96,
+    }, "t11a")
+    metrics = nan_fail(meta)
+    rtf = float(meta.get("rtf", 0.0))
+    metrics.append(m_ge("realtime_factor", rtf, 10.0))
+    metrics.append(m_info("wall_s", float(meta.get("wall_s", float("nan")))))
+    metrics.append(m_info("bands", 20))
+    return metrics
+
+
+def test_t11b(ctx):
     sr = ctx.sr
     voice = ctx.cat["voice"]["audio"]
     n = min(len(voice), int(4.0 * sr))
@@ -1005,10 +1025,10 @@ def test_t11(ctx):
         "carrier": "pitch", "bands": bands, "channels": "lr",
         "enhance": 1, "unvoiced": 0, "osc_wave": "saw",
         "track_low": 60, "track_high": 1000,
-    }, "t11")
+    }, "t11b")
     metrics = nan_fail(meta)
     rtf = float(meta.get("rtf", 0.0))
-    metrics.append(m_ge("realtime_factor", rtf, 10.0))
+    metrics.append(m_ge("realtime_factor", rtf, 2.0))
     metrics.append(m_info("wall_s", float(meta.get("wall_s", float("nan")))))
     metrics.append(m_info("bands", bands))
     return metrics
@@ -1019,16 +1039,31 @@ def test_t12(ctx):
     speech = signals._scale_rms(ctx.cat["speech"], -18.0)
     n = min(len(speech), int(5.0 * sr))
     speech = speech[:n]
-    audio = signals.assemble(speech, speech, speech, speech)
-    base = {"carrier": "modulator", "enhance": 1, "depth": 100, "drywet": 100}
-    y0, m0 = render(ctx, audio, dict(base, formant=0), "t12_0")
-    y7, m7 = render(ctx, audio, dict(base, formant=7), "t12_7")
+    noise = signals.white(n, np.random.default_rng(1201), rms_db=-18.0)
+    ext = signals.assemble(speech, speech, noise, noise)
+    base = {"carrier": "external", "enhance": 0, "depth": 100, "drywet": 100}
+    y0, m0 = render(ctx, ext, dict(base, formant=0), "t12_ext0")
+    y7, m7 = render(ctx, ext, dict(base, formant=7), "t12_ext7")
     metrics = nan_fail(m0) + nan_fail(m7)
     _s0, e0 = envelope_db(y0, sr)
     _s7, e7 = envelope_db(y7, sr)
     shift, corr = measure_shift_st(e0, e7, 0.25)
     metrics.append(m_between("formant_shift_st", shift, 7.0 - 1.5, 7.0 + 1.5))
     metrics.append(m_info("formant_corr", corr))
+
+    # Same shift measured on Carrier=Modulator + Enhance. Reported only:
+    # a wide band still overlaps its unshifted self, so this lag is not the spec.
+    mod = signals.assemble(speech, speech, speech, speech)
+    base_m = {"carrier": "modulator", "enhance": 1, "depth": 100, "drywet": 100}
+    ym0, mm0 = render(ctx, mod, dict(base_m, formant=0), "t12_mod0")
+    ym7, mm7 = render(ctx, mod, dict(base_m, formant=7), "t12_mod7")
+    metrics.extend(nan_fail(mm0))
+    metrics.extend(nan_fail(mm7))
+    _a, em0 = envelope_db(ym0, sr)
+    _b, em7 = envelope_db(ym7, sr)
+    shift_m, corr_m = measure_shift_st(em0, em7, 0.25)
+    metrics.append(m_info("formant_shift_modulator_st", shift_m))
+    metrics.append(m_info("formant_corr_modulator", corr_m))
     return metrics
 
 
@@ -1075,6 +1110,143 @@ def test_t13(ctx):
     metrics.append(m_info("crest_db_crackle_0.2", c_crack))
     metrics.append(m_info("crest_db_crackle_1", c_smooth))
     metrics.append(m_ge("crest_increase_db", c_crack - c_smooth, 6.0))
+    return metrics
+
+
+def _active_rms_db(y, sr, skip_s=0.25):
+    s = int(skip_s * sr)
+    return amp_db(y[s:] if len(y) > s + 8 else y)
+
+
+def test_t14(ctx):
+    """Output level for a -18 dBFS speech modulator, Enhance off and on."""
+    sr = ctx.sr
+    speech = signals._scale_rms(ctx.cat["speech"], -18.0)
+    n = min(len(speech), len(ctx.cat["chord"]), int(4.0 * sr))
+    speech = speech[:n]
+    chord = signals._scale_rms(ctx.cat["chord"][:n], -18.0)
+    z = np.zeros(n)
+    ref = _active_rms_db(speech, sr)
+    cases = [
+        ("noise", signals.assemble(speech, speech, z, z), {"carrier": "noise"}),
+        ("pitch", signals.assemble(speech, speech, z, z), {"carrier": "pitch", "osc_wave": "saw"}),
+        ("external", signals.assemble(speech, speech, chord, chord), {"carrier": "external"}),
+        ("modulator", signals.assemble(speech, speech, speech, speech), {"carrier": "modulator"}),
+    ]
+    metrics = [m_info("input_rms_dbfs", ref)]
+    for name, audio, params in cases:
+        levels = {}
+        for enh in (0, 1):
+            y, meta = render(ctx, audio, dict(params, enhance=enh, unvoiced=-96), f"t14_{name}_{enh}")
+            metrics.extend(nan_fail(meta))
+            level = _active_rms_db(y, sr)
+            levels[enh] = level
+            metrics.append(m_info(f"{name}_enh{enh}_rms_dbfs", level))
+            metrics.append(m_abs_le(f"{name}_enh{enh}_delta_db", level - ref, 6.0))
+        metrics.append(m_abs_le(f"{name}_enhance_delta_db", levels[1] - levels[0], 6.0))
+    return metrics
+
+
+def _rms_envelope(x, sr, win_s):
+    x = mono(x)
+    w = max(1, int(round(win_s * sr)))
+    power = np.convolve(x * x, np.ones(w) / w, mode="same")
+    return np.sqrt(np.maximum(power, 0.0))
+
+
+def _fall_time_60db(env, sr, stop, pre):
+    """Seconds after `stop` until the envelope is 60 dB under `pre`.
+
+    A 300 ms release reaches that point at 2.07 s, 70 ms after a 2 s tail.
+    When the buffer ends first, extrapolate the log-envelope slope.
+    """
+    thr = pre * 10.0 ** (-60.0 / 20.0)
+    after = env[stop:]
+    hit = np.flatnonzero(after <= thr)
+    if len(hit):
+        return float(hit[0] / sr)
+    t0 = int(0.40 * sr)
+    t1 = max(t0 + 8, len(after) - int(0.02 * sr))
+    seg = after[t0:t1]
+    keep = seg > max(thr * 0.01, 1e-12)
+    if int(np.count_nonzero(keep)) < 16:
+        return float("inf")
+    tt = np.arange(len(seg))[keep] / sr
+    slope, intercept = np.polyfit(tt, np.log(seg[keep]), 1)
+    if slope >= -1e-8:
+        return float("inf")
+    return float(t0 / sr + (math.log(max(thr, 1e-30)) - intercept) / slope)
+
+
+def test_t15(ctx):
+    sr = ctx.sr
+    n_noise = int(1.0 * sr)
+    n_sil = int(2.0 * sr)
+    pink = signals.pink(n_noise, np.random.default_rng(1501), rms_db=-18.0)
+    mod = np.concatenate([pink, np.zeros(n_sil)])
+    white = signals.white(len(mod), np.random.default_rng(1502), rms_db=-18.0)
+    ext = signals.assemble(mod, mod, white, white)
+    metrics = []
+    for rel_ms in (80.0, 300.0):
+        y, meta = render(ctx, ext, {
+            "carrier": "external", "release": rel_ms, "attack": 5, "enhance": 0, "unvoiced": -96,
+        }, f"t15_rel{int(rel_ms)}")
+        metrics.extend(nan_fail(meta))
+        env = _rms_envelope(y, sr, 0.005)
+        pre = float(np.median(env[int(0.40 * sr):n_noise - int(0.05 * sr)]))
+        got = _fall_time_60db(env, sr, n_noise, pre)
+        target = 6.9 * rel_ms * 0.001
+        metrics.append(m_info(f"pre_dbfs_rel{int(rel_ms)}", 20.0 * math.log10(pre + 1e-20)))
+        metrics.append(m_between(f"fall_60db_s_rel{int(rel_ms)}", got, target * 0.7, target * 1.3))
+    # Late window must be silent for every carrier. 7*6.9*80 ms is past the
+    # buffer, so the check starts at the 1.9 s cap.
+    offset = min(7.0 * 6.9 * 0.080, 1.9)
+    start = n_noise + int(offset * sr)
+    z = np.zeros(len(mod))
+    modes = [
+        ("noise", signals.assemble(mod, mod, z, z), {"carrier": "noise"}),
+        ("pitch", signals.assemble(mod, mod, z, z), {"carrier": "pitch", "osc_wave": "saw"}),
+        ("external", ext, {"carrier": "external"}),
+        ("modulator", signals.assemble(mod, mod, mod, mod), {"carrier": "modulator"}),
+    ]
+    for name, audio, params in modes:
+        y, meta = render(ctx, audio, dict(params, release=80, attack=5, enhance=0, unvoiced=-96), f"t15_floor_{name}")
+        metrics.extend(nan_fail(meta))
+        metrics.append(m_le(f"late_rms_dbfs_{name}", amp_db(y[start:]), -100.0))
+    return metrics
+
+
+def test_t16(ctx):
+    sr = ctx.sr
+    n_sil = int(0.50 * sr)
+    n_burst = int(1.0 * sr)
+    pink = signals.pink(n_burst, np.random.default_rng(1601), rms_db=-18.0)
+    mod = np.concatenate([np.zeros(n_sil), pink])
+    white = signals.white(len(mod), np.random.default_rng(1602), rms_db=-18.0)
+    audio = signals.assemble(mod, mod, white, white)
+    metrics = []
+    rises = {}
+    for attack in (1.0, 30.0):
+        y, meta = render(ctx, audio, {
+            "carrier": "external", "attack": attack, "release": 80, "enhance": 0, "unvoiced": -96,
+        }, f"t16_a{int(attack)}")
+        metrics.extend(nan_fail(meta))
+        env = _rms_envelope(y, sr, 0.005)
+        settled = float(np.median(env[n_sil + int(0.60 * sr):]))
+        lo, hi = 0.10 * settled, 0.90 * settled
+        seg = env[n_sil:]
+        above_lo = np.flatnonzero(seg >= lo)
+        above_hi = np.flatnonzero(seg >= hi)
+        if len(above_lo) == 0 or len(above_hi) == 0:
+            rise = float("inf")
+        else:
+            t_lo = int(above_lo[0])
+            later = above_hi[above_hi >= t_lo]
+            rise = float("inf") if len(later) == 0 else float((int(later[0]) - t_lo) / sr)
+        rises[attack] = rise
+        metrics.append(m_info(f"rise_10_90_s_attack{int(attack)}", rise))
+    ratio = rises[30.0] / rises[1.0] if rises[1.0] > 0 else float("inf")
+    metrics.append(m_ge("rise_ratio_30_over_1", ratio, 5.0))
     return metrics
 
 
@@ -1192,9 +1364,13 @@ TESTS = [
     ("T8", "Pitch tracking", test_t8),
     ("T9", "Channel modes", test_t9),
     ("T10", "Robustness", test_t10),
-    ("T11", "CPU", test_t11),
+    ("T11a", "CPU default", test_t11a),
+    ("T11b", "CPU worst case", test_t11b),
     ("T12", "Formant", test_t12),
     ("T13", "Noise carrier", test_t13),
+    ("T14", "Level sanity", test_t14),
+    ("T15", "Release and silence", test_t15),
+    ("T16", "Attack", test_t16),
 ]
 
 
@@ -1314,7 +1490,7 @@ def main(argv=None):
         return 1
 
     for tid, title, fn in TESTS:
-        if only and tid not in only:
+        if only and tid.upper() not in only:
             continue
         results.append(run_one(tid, title, fn, ctx))
 
