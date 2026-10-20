@@ -1,0 +1,6 @@
+tools/build/
+tools/ysfx/
+tools/.venv/
+tests/out/
+__pycache__/
+.DS_Store
