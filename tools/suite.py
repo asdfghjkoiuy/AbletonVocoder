@@ -1044,26 +1044,38 @@ def test_t12(ctx):
     base = {"carrier": "external", "enhance": 0, "depth": 100, "drywet": 100}
     y0, m0 = render(ctx, ext, dict(base, formant=0), "t12_ext0")
     y7, m7 = render(ctx, ext, dict(base, formant=7), "t12_ext7")
-    metrics = nan_fail(m0) + nan_fail(m7)
+    ym, mm = render(ctx, ext, dict(base, formant=-7), "t12_extm7")
+    metrics = nan_fail(m0) + nan_fail(m7) + nan_fail(mm)
     _s0, e0 = envelope_db(y0, sr)
     _s7, e7 = envelope_db(y7, sr)
+    _sm, em = envelope_db(ym, sr)
     shift, corr = measure_shift_st(e0, e7, 0.25)
+    shift_dn, corr_dn = measure_shift_st(e0, em, 0.25)
     metrics.append(m_between("formant_shift_st", shift, 7.0 - 1.5, 7.0 + 1.5))
+    metrics.append(m_between("formant_shift_down_st", shift_dn, -7.0 - 1.5, -7.0 + 1.5))
     metrics.append(m_info("formant_corr", corr))
+    metrics.append(m_info("formant_corr_down", corr_dn))
 
-    # Same shift measured on Carrier=Modulator + Enhance. Reported only:
-    # a wide band still overlaps its unshifted self, so this lag is not the spec.
+    # Carrier=Modulator + Enhance. The excitation is flat, so the envelope
+    # follows the shifted synthesis centres. Wider tolerance than the
+    # external measurement: one noise draw moves the downward lag a little.
     mod = signals.assemble(speech, speech, speech, speech)
     base_m = {"carrier": "modulator", "enhance": 1, "depth": 100, "drywet": 100}
     ym0, mm0 = render(ctx, mod, dict(base_m, formant=0), "t12_mod0")
     ym7, mm7 = render(ctx, mod, dict(base_m, formant=7), "t12_mod7")
+    ymm, mmm = render(ctx, mod, dict(base_m, formant=-7), "t12_modm7")
     metrics.extend(nan_fail(mm0))
     metrics.extend(nan_fail(mm7))
+    metrics.extend(nan_fail(mmm))
     _a, em0 = envelope_db(ym0, sr)
     _b, em7 = envelope_db(ym7, sr)
+    _c, emm = envelope_db(ymm, sr)
     shift_m, corr_m = measure_shift_st(em0, em7, 0.25)
-    metrics.append(m_info("formant_shift_modulator_st", shift_m))
+    shift_md, corr_md = measure_shift_st(em0, emm, 0.25)
+    metrics.append(m_between("formant_shift_modulator_st", shift_m, 7.0 - 2.0, 7.0 + 2.0))
+    metrics.append(m_between("formant_shift_modulator_down_st", shift_md, -7.0 - 2.0, -7.0 + 2.0))
     metrics.append(m_info("formant_corr_modulator", corr_m))
+    metrics.append(m_info("formant_corr_modulator_down", corr_md))
     return metrics
 
 
