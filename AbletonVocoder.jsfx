@@ -134,18 +134,12 @@ INV_SQRT2 = 0.7071067811865476;
 //   the envelope, so formants, a saw's tilt, and the release tail stay.
 //
 // Enhance on:
-//   each carrier band is divided by its own amplitude (floor ENH_FLOOR
-//   = -80 dBFS, boost cap ENH_CAP) and then scaled by the analysis
-//   envelope. At Depth 100% the NOMINAL constants cancel.
-//   That per-band gain moves formants only when the carrier is flat in
-//   every band. On the modulator itself the gain is E(f/r)/E(f), and the
-//   overlapping bands sum back to the original spectrum. Flattening the
-//   magnitude but keeping the modulator phase does not help: the short-term
-//   band levels are still the speech envelope, and this division puts it
-//   back. Carrier=Modulator with Enhance on therefore feeds the synthesis
-//   bank white noise at the calibrated carrier level, and the shifted
-//   centres place the analysis envelope at the new frequencies. Enhance
-//   off keeps the raw modulator. Off and on are crossfaded, not stacked.
+//   the carrier band is scaled to NOMINAL (cap ENH_CAP, and the carrier
+//   level used for that scale is held at ENH_FLOOR = -80 dBFS when the
+//   carrier band is quieter than that), then
+//   gain = (env / NOMINAL) ^ (Depth/100).
+//   At Depth 100% the NOMINALs cancel and the band output tracks env.
+//   Enhance off and on are crossfaded. They are not stacked.
 //   The TRIM_* gain is not applied while Enhance is on.
 DENS_EXP = 1;
 REF_LIN = exp(-18 * DB2A);
@@ -189,8 +183,6 @@ design_sig = -1;
 uv_env = 0;
 formant_sm = 0;
 enh_mix = 0;
-wh_rng = 7;
-wh_was = 0;
 lvl = 1;
 wet = 1;
 dev = 1;
@@ -200,7 +192,6 @@ ring_w = 0;
 ring_fill = 0;
 hop_count = 0;
 dec_i = 0;
-
 
 function polyblep(t, dt) (
   t < dt ? (
@@ -1037,13 +1028,9 @@ uv_off ? (
   // so fricatives read as noise and vowels do not.
   uv_amp = uv_env * uv_lin * 0.18;
 );
-uv_add_L = 0;
-uv_add_R = 0;
 uv_amp > 0.00000001 ? (
-  uv_add_L = (rand(2) - 1) * uv_amp;
-  uv_add_R = (rand(2) - 1) * uv_amp;
-  carL += uv_add_L;
-  carR += uv_add_R;
+  carL += (rand(2) - 1) * uv_amp;
+  carR += (rand(2) - 1) * uv_amp;
 );
 
 sumL = 0;
@@ -1057,33 +1044,7 @@ do_enh = enh_mix > 0.0005;
 ch_mono = active_ch < 0.5;
 ch_lr = active_ch > 1.5;
 // Same carrier sample on both pins: one synthesis filter, two gains.
-// Carrier=Modulator + Enhance: synthesis filters white noise, not the
-// modulator. See the Enhance note. The generator is a fixed LCG so the
-// carrier does not follow the host rand() sequence; a single 5 s draw can
-// park the downward formant reading on a side lobe.
-wh_on = active_carrier > 1.5 && active_carrier < 2.5 && enh_mix > 0.0005;
-wh_on ? (
-  wh_was ? 0 : wh_rng = 7;
-  wh_was = 1;
-  preL = carL - uv_add_L;
-  preR = carR - uv_add_R;
-  wh_rng = wh_rng * 1664525 + 1013904223;
-  wh_rng = wh_rng - 4294967296 * floor(wh_rng / 4294967296);
-  nL = (wh_rng / 2147483648 - 1) * NOISE_AMP;
-  nR = nL;
-  preL == preR ? 0 : (
-    wh_rng = wh_rng * 1664525 + 1013904223;
-    wh_rng = wh_rng - 4294967296 * floor(wh_rng / 4294967296);
-    nR = (wh_rng / 2147483648 - 1) * NOISE_AMP;
-  );
-  synthCarL = preL * (1 - enh_mix) + nL * enh_mix + uv_add_L;
-  synthCarR = preR * (1 - enh_mix) + nR * enh_mix + uv_add_R;
-) : (
-  wh_was = 0;
-  synthCarL = carL;
-  synthCarR = carR;
-);
-car_same = synthCarL == synthCarR;
+car_same = carL == carR;
 bi = 0;
 fast_share = fast_dry && gate_off && !ch_lr && !do_enh && (ch_mono || car_same) && n_run == n_bands;
 fast_share ? fast_bands() : (
@@ -1245,7 +1206,7 @@ loop(n_run,
 
   p_ic1 = stS[0];
   p_ic2 = stS[1];
-  p_v3 = synthCarL - p_ic2;
+  p_v3 = carL - p_ic2;
   p_v1 = b_a1 * p_ic1 + b_a2 * p_v3;
   p_v2 = p_ic2 + b_a2 * p_ic1 + b_a3 * p_v3;
   stS[0] = p_v1 + p_v1 - p_ic1;
@@ -1285,7 +1246,7 @@ loop(n_run,
     stT = stS + LANE_STEP;
     p_ic1 = stT[0];
     p_ic2 = stT[1];
-    p_v3 = synthCarR - p_ic2;
+    p_v3 = carR - p_ic2;
     p_v1 = b_a1 * p_ic1 + b_a2 * p_v3;
     p_v2 = p_ic2 + b_a2 * p_ic1 + b_a3 * p_v3;
     stT[0] = p_v1 + p_v1 - p_ic1;

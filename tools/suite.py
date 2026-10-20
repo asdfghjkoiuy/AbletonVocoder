@@ -1056,11 +1056,26 @@ def test_t12(ctx):
     metrics.append(m_info("formant_corr", corr))
     metrics.append(m_info("formant_corr_down", corr_dn))
 
-    # Carrier=Modulator + Enhance. The excitation is flat, so the envelope
-    # follows the shifted synthesis centres. Wider tolerance than the
-    # external measurement: one noise draw moves the downward lag a little.
-    mod = signals.assemble(speech, speech, speech, speech)
-    base_m = {"carrier": "modulator", "enhance": 1, "depth": 100, "drywet": 100}
+    # Carrier=Modulator + Enhance. Constant-pitch speech leaves a harmonic
+    # comb in the long-term spectrum, and the shape correlator locks onto
+    # that comb (the pitch must stay put). The synthetic voice glides
+    # 100→300 Hz, so the harmonics smear. 40 bands: a 7 st move then spans
+    # several bands. v1's band slider stops at 32.
+    if ctx.v1:
+        for name in (
+            "formant_shift_modulator_st",
+            "formant_shift_modulator_down_st",
+            "formant_corr_modulator",
+            "formant_corr_modulator_down",
+        ):
+            metrics.append(metric(name, None, "n/a", "NA", "v1 has no 40-band setting"))
+        return metrics
+    voice = signals._scale_rms(ctx.cat["voice"]["audio"], -18.0)
+    mod = signals.assemble(voice, voice, voice, voice)
+    base_m = {
+        "carrier": "modulator", "enhance": 1, "depth": 100, "drywet": 100,
+        "bands": 40,
+    }
     ym0, mm0 = render(ctx, mod, dict(base_m, formant=0), "t12_mod0")
     ym7, mm7 = render(ctx, mod, dict(base_m, formant=7), "t12_mod7")
     ymm, mmm = render(ctx, mod, dict(base_m, formant=-7), "t12_modm7")
