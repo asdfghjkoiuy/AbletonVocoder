@@ -1,7 +1,7 @@
 desc:Ableton Vocoder
 // Ableton Live-style channel vocoder.
-// No @gfx in this build: REAPER shows the default sliders. The GUI phase
-// reads the memory map below; do not move those offsets.
+// @gfx is the device panel. It may read 0..79 and the slider variables,
+// and it may write BAND_ATT. Do not move the offsets below.
 
 // ---------------------------------------------------------------------------
 // Memory map (EEL2 heap indices)
@@ -830,6 +830,20 @@ global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_c, rel_c, GAIN_CAP, modL
   sumR = sumL;
 );
 
+// GUI only. Asks the host for a hidpi framebuffer. The audio path never
+// reads these; @init may clear them again when transport restarts.
+gfx_ext_retina = 1;
+gui_drag = 0;
+gui_menu = 0;
+gui_arm = 0;
+gui_click_t = -1;
+gui_click_id = 0;
+gui_prev_cap = 0;
+gui_prev_x = 0;
+gui_prev_y = 0;
+gui_a0 = 210 * PI / 180;
+gui_asweep = 300 * PI / 180;
+
 @slider
 param_dirty = 1;
 
@@ -1443,3 +1457,978 @@ file_avail(0) < 0 ? (
   file_var(0, ser_ver);
   ser_ver == SER_VER && file_avail(0) > 0 ? file_mem(0, BAND_ATT, MAXB);
 );
+
+@gfx 780 290
+
+// Device panel. Slider edits use the bitmask form 2^(index-1) plus
+// slider_automate so REAPER records undo and automation. BAND_ATT is not a
+// slider: sliderchange(-1) from @gfx is the documented undo point, issued
+// once when a band gesture ends (or immediately for a click reset).
+
+function gui_c_bg() ( gfx_r = 49/255; gfx_g = 51/255; gfx_b = 54/255; gfx_a = 1; );
+function gui_c_panel() ( gfx_r = 32/255; gfx_g = 34/255; gfx_b = 36/255; gfx_a = 1; );
+function gui_c_screen() ( gfx_r = 16/255; gfx_g = 18/255; gfx_b = 20/255; gfx_a = 1; );
+function gui_c_text() ( gfx_r = 230/255; gfx_g = 230/255; gfx_b = 230/255; gfx_a = 1; );
+function gui_c_dim() ( gfx_r = 148/255; gfx_g = 150/255; gfx_b = 154/255; gfx_a = 1; );
+function gui_c_teal() ( gfx_r = 42/255; gfx_g = 210/255; gfx_b = 216/255; gfx_a = 1; );
+function gui_c_orange() ( gfx_r = 255/255; gfx_g = 149/255; gfx_b = 18/255; gfx_a = 1; );
+function gui_c_ink() ( gfx_r = 36/255; gfx_g = 24/255; gfx_b = 14/255; gfx_a = 1; );
+function gui_c_line() ( gfx_r = 18/255; gfx_g = 18/255; gfx_b = 20/255; gfx_a = 1; );
+function gui_c_knob() ( gfx_r = 22/255; gfx_g = 24/255; gfx_b = 26/255; gfx_a = 1; );
+function gui_c_track() ( gfx_r = 78/255; gfx_g = 80/255; gfx_b = 84/255; gfx_a = 1; );
+
+function gui_X(v) ( gui_ox + v * gui_s; );
+function gui_Y(v) ( gui_oy + v * gui_s; );
+function gui_S(v) ( v * gui_s; );
+
+function gui_box(x, y, w, h) local(x2, y2) (
+  x2 = x + w - 1;
+  y2 = y + h - 1;
+  gfx_line(x, y, x2, y, 0);
+  gfx_line(x2, y, x2, y2, 0);
+  gfx_line(x2, y2, x, y2, 0);
+  gfx_line(x, y2, x, y, 0);
+);
+
+function gui_in(x, y, w, h) (
+  mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+);
+function gui_in_knob(cx, cy, r) (
+  gui_in(cx - r - gui_S(8), cy - r - gui_S(14), r * 2 + gui_S(16), r * 2 + gui_S(32));
+);
+function gui_hit_pow() local(dx, dy, rr) (
+  dx = mouse_x - r_pow_x;
+  dy = mouse_y - r_pow_y;
+  rr = r_pow_r + gui_S(5);
+  dx * dx + dy * dy <= rr * rr;
+);
+
+function gui_q(val, lo, hi, step) local(q) (
+  val < lo ? val = lo;
+  val > hi ? val = hi;
+  q = floor(val / step + 0.5) * step;
+  q < lo ? q = lo;
+  q > hi ? q = hi;
+  q;
+);
+function gui_linn(val, lo, hi) local(n) (
+  n = (val - lo) / (hi - lo);
+  n < 0 ? 0 : (n > 1 ? 1 : n);
+);
+function gui_logn(val, lo, hi) local(n) (
+  val < lo ? val = lo;
+  val > hi ? val = hi;
+  n = log(val / lo) / log(hi / lo);
+  n < 0 ? 0 : (n > 1 ? 1 : n);
+);
+function gui_lin_set(val, lo, hi, step, dy) local(d) (
+  d = dy / (160 * gui_s) * (hi - lo);
+  gui_shift ? d *= 0.1;
+  gui_q(val + d, lo, hi, step);
+);
+function gui_log_set(val, lo, hi, step, dy) local(n, d) (
+  val < lo ? val = lo;
+  n = log(val / lo) / log(hi / lo);
+  d = dy / (160 * gui_s);
+  gui_shift ? d *= 0.1;
+  n += d;
+  n < 0 ? n = 0;
+  n > 1 ? n = 1;
+  gui_q(lo * exp(n * log(hi / lo)), lo, hi, step);
+);
+function gui_lin_wheel(val, lo, hi, step) local(d) (
+  d = gui_wheel * (gui_shift ? step : max(step, (hi - lo) * 0.04));
+  gui_q(val + d, lo, hi, step);
+);
+function gui_log_wheel(val, lo, hi, step) local(n, d) (
+  val < lo ? val = lo;
+  n = log(val / lo) / log(hi / lo);
+  d = gui_wheel * (gui_shift ? 0.01 : 0.05);
+  n += d;
+  n < 0 ? n = 0;
+  n > 1 ? n = 1;
+  gui_q(lo * exp(n * log(hi / lo)), lo, hi, step);
+);
+
+function gui_commit(idx) (
+  gui_mask = 2 ^ (idx - 1);
+  sliderchange(gui_mask);
+  slider_automate(gui_mask, 0);
+);
+function gui_end(idx) (
+  gui_mask = 2 ^ (idx - 1);
+  slider_automate(gui_mask, 1);
+);
+function gui_dirty() ( sliderchange(-1); );
+function gui_push(idx, val) (
+  slider(idx) = val;
+  gui_commit(idx);
+  gui_moved = 1;
+);
+function gui_set(idx, val) (
+  slider(idx) = val;
+  gui_commit(idx);
+  gui_end(idx);
+);
+function gui_drag_lin(idx, lo, hi, step) local(dy, old, nv) (
+  dy = gui_prev_y - mouse_y;
+  abs(dy) > 0.01 ? (
+    old = slider(idx);
+    nv = gui_lin_set(old, lo, hi, step, dy);
+    abs(nv - old) > step * 0.25 ? gui_push(idx, nv);
+  );
+);
+function gui_drag_log(idx, lo, hi, step) local(dy, old, nv) (
+  dy = gui_prev_y - mouse_y;
+  abs(dy) > 0.01 ? (
+    old = slider(idx);
+    nv = gui_log_set(old, lo, hi, step, dy);
+    abs(nv - old) > step * 0.25 ? gui_push(idx, nv);
+  );
+);
+function gui_wheel_lin(idx, lo, hi, step) local(old, nv) (
+  old = slider(idx);
+  nv = gui_lin_wheel(old, lo, hi, step);
+  abs(nv - old) > step * 0.25 ? gui_set(idx, nv);
+);
+function gui_wheel_log(idx, lo, hi, step) local(old, nv) (
+  old = slider(idx);
+  nv = gui_log_wheel(old, lo, hi, step);
+  abs(nv - old) > step * 0.25 ? gui_set(idx, nv);
+);
+
+function gui_ctrl(id, idx, x, y, w, h, lo, hi, step, dflt, islog, knob) local(hit) (
+  hit = knob ? gui_in_knob(x, y, w) : gui_in(x, y, w, h);
+  gui_drag == id && !gui_click && (gui_lmb || gui_up) ? (
+    islog ? gui_drag_log(idx, lo, hi, step) : gui_drag_lin(idx, lo, hi, step);
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && hit ? (
+    (gui_click_id == id && (time_precise() - gui_click_t) < 0.35) ? (
+      gui_set(idx, dflt);
+      gui_drag = 0;
+    ) : (
+      gui_drag = id;
+      gui_drag_idx = idx;
+      gui_moved = 0;
+    );
+    gui_hit_id = id;
+  );
+  gui_drag == 0 && !gui_click && gui_hit_id == 0 && hit && abs(gui_wheel) >= 0.5 ? (
+    islog ? gui_wheel_log(idx, lo, hi, step) : gui_wheel_lin(idx, lo, hi, step);
+    gui_hit_id = id;
+  );
+);
+
+function gui_band_at(mx) local(t, i) (
+  t = (mx - r_bar_x) / max(r_bar_w, 1);
+  t < 0 ? t = 0;
+  t > 0.999999 ? t = 0.999999;
+  i = floor(t * gui_nb);
+  i < 0 ? i = 0;
+  i >= gui_nb ? i = gui_nb - 1;
+  i;
+);
+function gui_att_at(my) local(t) (
+  t = (my - r_bar_y) / max(r_bar_h, 1);
+  t < 0 ? t = 0;
+  t > 1 ? t = 1;
+  gui_q(-60 * t, -60, 0, 0.1);
+);
+function gui_band_span(i0, a0, i1, a1) local(i, att, dir, n) (
+  i0 < 0 ? i0 = 0;
+  i1 < 0 ? i1 = 0;
+  i0 >= gui_nb ? i0 = gui_nb - 1;
+  i1 >= gui_nb ? i1 = gui_nb - 1;
+  i0 == i1 ? (
+    att = gui_q(a1, -60, 0, 0.1);
+    abs(BAND_ATT[i0] - att) > 0.05 ? (
+      BAND_ATT[i0] = att;
+      gui_bdirty = 1;
+    );
+  ) : (
+    dir = i1 > i0 ? 1 : -1;
+    n = abs(i1 - i0);
+    i = i0;
+    loop(n + 1,
+      att = a0 + (a1 - a0) * (i - i0) / (i1 - i0);
+      att = gui_q(att, -60, 0, 0.1);
+      abs(BAND_ATT[i] - att) > 0.05 ? (
+        BAND_ATT[i] = att;
+        gui_bdirty = 1;
+      );
+      i += dir;
+    );
+  );
+);
+
+function gui_xy_input() local(nx, ny, rv, cv) (
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_pad_x, r_pad_y, r_pad_w, r_pad_h) ? (
+    (gui_click_id == 16 && (time_precise() - gui_click_t) < 0.35) ? (
+      gui_set(19, 1);
+      gui_set(20, 1);
+      gui_drag = 0;
+    ) : (
+      gui_drag = 16;
+      gui_xy_r = 0;
+      gui_xy_c = 0;
+      gui_moved = 0;
+    );
+    gui_hit_id = 16;
+  );
+  gui_drag == 16 && (gui_lmb || gui_up) ? (
+    nx = (mouse_x - r_pad_x) / max(r_pad_w, 1);
+    ny = 1 - (mouse_y - r_pad_y) / max(r_pad_h, 1);
+    nx < 0 ? nx = 0;
+    nx > 1 ? nx = 1;
+    ny < 0 ? ny = 0;
+    ny > 1 ? ny = 1;
+    rv = gui_q(nx, 0, 1, 0.01);
+    cv = gui_q(ny, 0, 1, 0.01);
+    abs(rv - slider(19)) >= 0.005 ? (
+      gui_push(19, rv);
+      gui_xy_r = 1;
+    );
+    abs(cv - slider(20)) >= 0.005 ? (
+      gui_push(20, cv);
+      gui_xy_c = 1;
+    );
+  );
+  gui_drag == 0 && !gui_click && gui_hit_id == 0 && gui_in(r_pad_x, r_pad_y, r_pad_w, r_pad_h) && abs(gui_wheel) >= 0.5 ? (
+    gui_shift ? gui_wheel_lin(19, 0, 1, 0.01) : gui_wheel_lin(20, 0, 1, 0.01);
+    gui_hit_id = 16;
+  );
+);
+
+function gui_band_input() local(hit, zb, za, zi, zany) (
+  hit = gui_in(r_disp_x, r_disp_y, r_disp_w, r_disp_h);
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && hit ? (
+    gui_alt ? (
+      zi = 0;
+      zany = 0;
+      loop(40,
+        abs(BAND_ATT[zi]) > 0.05 ? (
+          BAND_ATT[zi] = 0;
+          zany = 1;
+        );
+        zi += 1;
+      );
+      zany ? gui_dirty();
+      gui_drag = 0;
+      gui_bdirty = 0;
+    ) : (
+      zb = gui_band_at(mouse_x);
+      (gui_click_id == 1000 + zb && (time_precise() - gui_click_t) < 0.35) ? (
+        abs(BAND_ATT[zb]) > 0.05 ? (
+          BAND_ATT[zb] = 0;
+          gui_dirty();
+        );
+        gui_drag = 0;
+      ) : (
+        gui_drag = 17;
+        gui_bdirty = 0;
+      );
+    );
+    gui_hit_id = 1000 + gui_band_at(mouse_x);
+  );
+  gui_drag == 17 && (gui_lmb || gui_up) ? (
+    zb = gui_band_at(mouse_x);
+    za = gui_att_at(mouse_y);
+    gui_click ? gui_band_span(zb, za, zb, za) : gui_band_span(gui_last_i, gui_last_a, zb, za);
+    gui_last_i = zb;
+    gui_last_a = za;
+  );
+);
+
+function gui_menu_geom() local(n, ih, y, h) (
+  ih = gui_S(18);
+  gui_menu == 1 ? (
+    gui_mx = r_car_x;
+    gui_mw = r_car_w;
+    n = 4;
+    y = r_car_y + r_car_h + gui_S(2);
+  ) : gui_menu == 2 ? (
+    gui_mx = r_bnd_x;
+    gui_mw = max(r_bnd_w, gui_S(56));
+    n = 10;
+    y = r_bnd_y - n * ih;
+  ) : (
+    gui_mx = r_wave_x;
+    gui_mw = r_wave_w;
+    n = 4;
+    y = r_wave_y + r_wave_h + gui_S(2);
+  );
+  h = n * ih;
+  y < 2 ? y = 2;
+  y + h > gfx_h - 2 ? y = gfx_h - 2 - h;
+  gui_mx < 2 ? gui_mx = 2;
+  gui_mx + gui_mw > gfx_w - 2 ? gui_mx = gfx_w - 2 - gui_mw;
+  gui_my = y;
+  gui_mih = ih;
+  gui_mn = n;
+);
+function gui_menu_input() local(j, hit) (
+  gui_menu <= 0 ? 0 : (
+    gui_blocked = 1;
+    gui_menu_geom();
+    !gui_lmb ? gui_arm = 1;
+    gui_arm && gui_click ? (
+      hit = gui_in(gui_mx, gui_my, gui_mw, gui_mn * gui_mih);
+      hit ? (
+        j = floor((mouse_y - gui_my) / gui_mih);
+        j < 0 ? j = 0;
+        j >= gui_mn ? j = gui_mn - 1;
+        gui_menu == 1 ? gui_set(1, j) : gui_menu == 2 ? gui_set(2, j) : gui_set(21, j);
+      );
+      gui_menu = 0;
+      gui_arm = 0;
+      gui_hit_id = 0;
+    );
+  );
+);
+
+function gui_release() (
+  gui_up && gui_drag ? (
+    gui_drag == 17 ? (
+      gui_bdirty ? gui_dirty();
+      gui_bdirty = 0;
+    ) : gui_drag == 16 ? (
+      gui_xy_r ? gui_end(19);
+      gui_xy_c ? gui_end(20);
+    ) : gui_moved ? (
+      gui_end(gui_drag_idx);
+    );
+    gui_drag = 0;
+    gui_moved = 0;
+    gui_xy_r = 0;
+    gui_xy_c = 0;
+  );
+);
+
+function gui_controls() (
+  gui_hit_pow() && gui_click && gui_drag == 0 && gui_hit_id == 0 ? (
+    gui_set(25, s_device > 0.5 ? 0 : 1);
+    gui_hit_id = 39;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_car_x, r_car_y, r_car_w, r_car_h) ? (
+    gui_menu = 1;
+    gui_arm = 0;
+    gui_hit_id = 30;
+  );
+  s_carrier >= 2.5 && gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_wave_x, r_wave_y, r_wave_w, r_wave_h) ? (
+    gui_menu = 3;
+    gui_arm = 0;
+    gui_hit_id = 32;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_enh_x, r_enh_y, r_enh_w, r_enh_h) ? (
+    gui_set(15, s_enhance > 0.5 ? 0 : 1);
+    gui_hit_id = 33;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_spd_x, r_spd_y, r_spd_w, r_spd_h) ? (
+    gui_set(18, s_uvspeed > 0.5 ? 0 : 1);
+    gui_hit_id = 34;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_ch_x, r_ch_y0, r_ch_w, r_ch_h) ? (
+    gui_set(14, 0);
+    gui_hit_id = 36;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_ch_x, r_ch_y1, r_ch_w, r_ch_h) ? (
+    gui_set(14, 1);
+    gui_hit_id = 37;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_ch_x, r_ch_y2, r_ch_w, r_ch_h) ? (
+    gui_set(14, 2);
+    gui_hit_id = 38;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_fm_x, r_fm_y, r_fm_w, r_fm_h) ? (
+    gui_set(6, s_fmode > 0.5 ? 0 : 1);
+    gui_hit_id = 35;
+  );
+  gui_click && gui_drag == 0 && gui_hit_id == 0 && gui_in(r_bnd_x, r_bnd_y, r_bnd_w, r_bnd_h) ? (
+    gui_menu = 2;
+    gui_arm = 0;
+    gui_hit_id = 31;
+  );
+  gui_ctrl(1, 9, r_dp_x, r_dp_y, r_dp_r, 0, 0, 200, 1, 100, 0, 1);
+  gui_ctrl(2, 10, r_ak_x, r_ak_y, r_ak_r, 0, 0.1, 100, 0.1, 5, 1, 1);
+  gui_ctrl(3, 11, r_re_x, r_re_y, r_re_r, 0, 1, 1000, 1, 80, 1, 1);
+  gui_ctrl(4, 12, r_fo_x, r_fo_y, r_fo_r, 0, -12, 12, 0.1, 0, 0, 1);
+  gui_ctrl(5, 13, r_dw_x, r_dw_y, r_dw_r, 0, 0, 100, 1, 100, 0, 1);
+  gui_ctrl(6, 16, r_uv_x, r_uv_y, r_uv_r, 0, -96, 0, 1, -96, 0, 1);
+  gui_ctrl(7, 17, r_sens_x, r_sens_y, r_sens_w, r_sens_h, 0, 100, 1, 50, 0, 0);
+  gui_ctrl(8, 5, r_bw_x, r_bw_y, r_bw_w, r_bw_h, 10, 200, 1, 100, 0, 0);
+  gui_ctrl(9, 7, r_gt_x, r_gt_y, r_gt_w, r_gt_h, -96, 0, 1, -96, 0, 0);
+  gui_ctrl(10, 8, r_lv_x, r_lv_y, r_lv_w, r_lv_h, -24, 24, 0.1, 0, 0, 0);
+  gui_ctrl(11, 3, r_rl_x, r_rl_y, r_rl_w, r_rl_h, 20, 2000, 1, 80, 1, 0);
+  gui_ctrl(12, 4, r_rh_x, r_rh_y, r_rh_w, r_rh_h, 1000, 20000, 1, 18000, 1, 0);
+  s_carrier < 0.5 ? gui_xy_input() : 0;
+  s_carrier >= 2.5 ? (
+    gui_ctrl(13, 22, r_pit_x, r_pit_y, r_pit_w, r_pit_h, -24, 24, 1, 0, 0, 0);
+    gui_ctrl(14, 23, r_lo_x, r_lo_y, r_lo_w, r_lo_h, 20, 1000, 1, 60, 1, 0);
+    gui_ctrl(15, 24, r_hi_x, r_hi_y, r_hi_w, r_hi_h, 100, 2000, 1, 1000, 1, 0);
+  );
+  gui_band_input();
+);
+
+function gui_begin() local(zk) (
+  gui_s = min(gfx_w / 780, gfx_h / 290);
+  gui_s < 0.6 ? gui_s = 0.6;
+  gui_ox = (gfx_w - 780 * gui_s) * 0.5;
+  gui_oy = (gfx_h - 290 * gui_s) * 0.5;
+  gui_fs = floor(11 * gui_s + 0.5);
+  gui_fb = floor(16 * gui_s + 0.5);
+  gui_fm = floor(10 * gui_s + 0.5);
+  gui_fs < 8 ? gui_fs = 8;
+  gui_fb < 8 ? gui_fb = 8;
+  gui_fm < 8 ? gui_fm = 8;
+  gui_fs > 64 ? gui_fs = 64;
+  gui_fb > 72 ? gui_fb = 72;
+  gui_fm > 48 ? gui_fm = 48;
+  gfx_setfont(1, "Arial", gui_fs);
+  gfx_setfont(2, "Arial", gui_fb, 'b');
+  gfx_setfont(3, "Arial", gui_fm);
+  gfx_setfont(1);
+  zk = 0;
+  loop(4, zk = gfx_getchar(0); );
+  gui_lmb = mouse_cap & 1;
+  gui_click = gui_lmb && !(gui_prev_cap & 1);
+  gui_up = !gui_lmb && (gui_prev_cap & 1);
+  gui_shift = mouse_cap & 8;
+  gui_alt = mouse_cap & 16;
+  gui_wheel = mouse_wheel / 120;
+  mouse_wheel = 0;
+  mouse_hwheel = 0;
+);
+
+function gui_layout() (
+  r_pow_x = gui_X(16);
+  r_pow_y = gui_Y(13);
+  r_pow_r = gui_S(6.5);
+  r_car_x = gui_X(10);
+  r_car_y = gui_Y(42);
+  r_car_w = gui_S(142);
+  r_car_h = gui_S(18);
+  r_ctx_x = gui_X(10);
+  r_ctx_y = gui_Y(66);
+  r_ctx_w = gui_S(142);
+  r_ctx_h = gui_S(108);
+  r_pad_x = gui_X(16);
+  r_pad_y = gui_Y(72);
+  r_pad_w = gui_S(130);
+  r_pad_h = gui_S(96);
+  r_wave_x = gui_X(16);
+  r_wave_y = gui_Y(80);
+  r_wave_w = gui_S(130);
+  r_wave_h = gui_S(16);
+  r_pit_x = gui_X(16);
+  r_pit_y = gui_Y(102);
+  r_pit_w = gui_S(130);
+  r_pit_h = gui_S(16);
+  r_lo_x = gui_X(16);
+  r_lo_y = gui_Y(122);
+  r_lo_w = gui_S(130);
+  r_lo_h = gui_S(16);
+  r_hi_x = gui_X(16);
+  r_hi_y = gui_Y(142);
+  r_hi_w = gui_S(130);
+  r_hi_h = gui_S(16);
+  r_enh_x = gui_X(10);
+  r_enh_y = gui_Y(180);
+  r_enh_w = gui_S(68);
+  r_enh_h = gui_S(16);
+  r_uv_x = gui_X(40);
+  r_uv_y = gui_Y(232);
+  r_uv_r = gui_S(15);
+  r_sens_x = gui_X(90);
+  r_sens_y = gui_Y(208);
+  r_sens_w = gui_S(58);
+  r_sens_h = gui_S(16);
+  r_spd_x = gui_X(90);
+  r_spd_y = gui_Y(232);
+  r_spd_w = gui_S(58);
+  r_spd_h = gui_S(16);
+  r_disp_x = gui_X(164);
+  r_disp_y = gui_Y(32);
+  r_disp_w = gui_S(432);
+  r_disp_h = gui_S(170);
+  r_bar_x = r_disp_x + gui_S(8);
+  r_bar_y = r_disp_y + gui_S(8);
+  r_bar_w = r_disp_w - gui_S(16);
+  r_bar_h = r_disp_h - gui_S(16);
+  r_bnd_x = gui_X(164);
+  r_bnd_y = gui_Y(220);
+  r_bnd_w = gui_S(48);
+  r_bnd_h = gui_S(18);
+  r_rl_x = gui_X(222);
+  r_rl_y = gui_Y(220);
+  r_rl_w = gui_S(66);
+  r_rl_h = gui_S(16);
+  r_rh_x = gui_X(222);
+  r_rh_y = gui_Y(240);
+  r_rh_w = gui_S(66);
+  r_rh_h = gui_S(16);
+  r_bw_x = gui_X(298);
+  r_bw_y = gui_Y(220);
+  r_bw_w = gui_S(50);
+  r_bw_h = gui_S(18);
+  r_fm_x = gui_X(356);
+  r_fm_y = gui_Y(220);
+  r_fm_w = gui_S(72);
+  r_fm_h = gui_S(18);
+  r_gt_x = gui_X(436);
+  r_gt_y = gui_Y(220);
+  r_gt_w = gui_S(56);
+  r_gt_h = gui_S(18);
+  r_lv_x = gui_X(500);
+  r_lv_y = gui_Y(220);
+  r_lv_w = gui_S(62);
+  r_lv_h = gui_S(18);
+  r_dp_x = gui_X(652);
+  r_dp_y = gui_Y(70);
+  r_dp_r = gui_S(16);
+  r_ch_x = gui_X(704);
+  r_ch_w = gui_S(64);
+  r_ch_h = gui_S(16);
+  r_ch_y0 = gui_Y(40);
+  r_ch_y1 = gui_Y(60);
+  r_ch_y2 = gui_Y(80);
+  r_ak_x = gui_X(652);
+  r_ak_y = gui_Y(162);
+  r_ak_r = gui_S(14);
+  r_fo_x = gui_X(732);
+  r_fo_y = gui_Y(162);
+  r_fo_r = gui_S(14);
+  r_re_x = gui_X(652);
+  r_re_y = gui_Y(246);
+  r_re_r = gui_S(14);
+  r_dw_x = gui_X(732);
+  r_dw_y = gui_Y(246);
+  r_dw_r = gui_S(14);
+  gui_nb = (floor(s_bands + 0.5) + 1) * 4;
+  gui_nb < 4 ? gui_nb = 4;
+  gui_nb > 40 ? gui_nb = 40;
+);
+
+function gui_input() (
+  gui_hit_id = 0;
+  gui_blocked = 0;
+  gui_menu > 0 ? gui_menu_input() : 0;
+  gui_blocked ? 0 : gui_controls();
+  gui_release();
+  gui_click ? (
+    gui_click_t = time_precise();
+    gui_click_id = gui_hit_id;
+  );
+);
+
+function gui_arc(cx, cy, r, a0, a1) local(n, i) (
+  n = gui_s >= 2.2 ? 3 : (gui_s >= 1.35 ? 2 : 1);
+  i = 0;
+  loop(n,
+    gfx_arc(cx, cy, r - i, a0, a1, 1);
+    i += 1;
+  );
+);
+function gui_knob(cx, cy, r, norm) local(a0, a1, ang, rad) (
+  norm < 0 ? norm = 0;
+  norm > 1 ? norm = 1;
+  gui_c_knob();
+  gfx_circle(cx, cy, r, 1, 1);
+  gui_c_line();
+  gfx_circle(cx, cy, r, 0, 1);
+  a0 = gui_a0;
+  rad = r - max(1, gui_s);
+  gui_c_track();
+  gui_arc(cx, cy, rad, a0, a0 + gui_asweep);
+  a1 = a0 + gui_asweep * norm;
+  gui_c_teal();
+  norm > 0.004 ? gui_arc(cx, cy, rad, a0, a1);
+  ang = a1;
+  gfx_line(cx + sin(ang) * (r * 0.22), cy - cos(ang) * (r * 0.22), cx + sin(ang) * max(1, rad - gui_s), cy - cos(ang) * max(1, rad - gui_s), 1);
+);
+function gui_kcap(cx, cy, r) (
+  gui_c_dim();
+  gfx_setfont(3);
+  gfx_x = cx - gui_S(42);
+  gfx_y = cy - r - gui_fm - gui_S(2);
+  gfx_drawstr(#gui_s, 5, cx + gui_S(42), cy - r);
+);
+function gui_kval(cx, cy, r) (
+  gui_c_teal();
+  gfx_setfont(1);
+  gfx_x = cx - gui_S(44);
+  gfx_y = cy + r + gui_S(1);
+  gfx_drawstr(#gui_s, 5, cx + gui_S(44), cy + r + gui_fs + gui_S(3));
+);
+function gui_above_l(x, y) (
+  gui_c_dim();
+  gfx_setfont(3);
+  gfx_x = x;
+  gfx_y = y - gui_fm - gui_S(2);
+  gfx_drawstr(#gui_s);
+);
+function gui_btn(x, y, w, h, on) (
+  on ? gui_c_orange() : gui_c_panel();
+  gfx_rect(x, y, w, h);
+  gui_c_line();
+  gui_box(x, y, w, h);
+  on ? gui_c_ink() : gui_c_text();
+  gfx_setfont(1);
+  gfx_x = x;
+  gfx_y = y;
+  gfx_drawstr(#gui_s, 5, x + w, y + h);
+);
+function gui_drop(x, y, w, h, open) local(cw) (
+  gui_c_panel();
+  gfx_rect(x, y, w, h);
+  open ? gui_c_orange() : gui_c_teal();
+  gui_box(x, y, w, h);
+  gui_c_text();
+  gfx_setfont(1);
+  gfx_x = x + gui_S(5);
+  gfx_y = y;
+  gfx_drawstr(#gui_s, 4, x + w - gui_S(14), y + h);
+  gui_c_dim();
+  cw = max(4, gui_S(5));
+  gfx_triangle(x + w - gui_S(12), y + h * 0.38, x + w - gui_S(12) + cw, y + h * 0.38, x + w - gui_S(12) + cw * 0.5, y + h * 0.38 + cw * 0.7);
+);
+function gui_num(x, y, w, h) (
+  gui_c_panel();
+  gfx_rect(x, y, w, h);
+  gui_c_line();
+  gui_box(x, y, w, h);
+  gui_c_teal();
+  gfx_setfont(1);
+  gfx_x = x;
+  gfx_y = y;
+  gfx_drawstr(#gui_s, 5, x + w, y + h);
+);
+function gui_row_l(x, y, w, h) (
+  gui_c_dim();
+  gfx_setfont(3);
+  gfx_x = x + gui_S(4);
+  gfx_y = y;
+  gfx_drawstr(#gui_s, 4, x + gui_S(46), y + h);
+);
+function gui_row_v(x, y, w, h) (
+  gui_c_teal();
+  gfx_setfont(1);
+  gfx_x = x + gui_S(40);
+  gfx_y = y;
+  gfx_drawstr(#gui_s, 6, x + w - gui_S(4), y + h);
+);
+function gui_hint() (
+  gui_c_text();
+  gfx_setfont(1);
+  gfx_x = r_ctx_x + gui_S(4);
+  gfx_y = r_ctx_y;
+  gfx_drawstr(#gui_s, 5, r_ctx_x + r_ctx_w - gui_S(4), r_ctx_y + r_ctx_h);
+);
+
+function gui_name_carrier(v) (
+  v < 0.5 ? sprintf(#gui_s, "Noise") : v < 1.5 ? sprintf(#gui_s, "External") : v < 2.5 ? sprintf(#gui_s, "Modulator") : sprintf(#gui_s, "Pitch Tracking");
+);
+function gui_name_wave(v) (
+  v < 0.5 ? sprintf(#gui_s, "Saw") : v < 1.5 ? sprintf(#gui_s, "Pulse 50%%") : v < 2.5 ? sprintf(#gui_s, "Pulse 25%%") : sprintf(#gui_s, "Pulse 12.5%%");
+);
+function gui_fmt_pct(val) ( sprintf(#gui_s, "%.0f%%", val); );
+function gui_fmt_ms(val, coarse) (
+  coarse || val >= 10 ? sprintf(#gui_s, "%.0f ms", val) : sprintf(#gui_s, "%.1f ms", val);
+);
+function gui_fmt_db(val, dec) (
+  val <= -95.5 ? sprintf(#gui_s, "-inf") : dec ? (abs(val) < 0.05 ? sprintf(#gui_s, "0.0 dB") : sprintf(#gui_s, "%+.1f dB", val)) : sprintf(#gui_s, "%.0f dB", val);
+);
+function gui_fmt_st(val, dec) (
+  dec ? (abs(val) < 0.05 ? sprintf(#gui_s, "0.0 st") : sprintf(#gui_s, "%+.1f st", val)) : (abs(val) < 0.5 ? sprintf(#gui_s, "0 st") : sprintf(#gui_s, "%+.0f st", val));
+);
+function gui_fmt_hz(val) local(k, r) (
+  val >= 999.5 ? (
+    k = val / 1000;
+    k >= 10 ? (
+      r = floor(k + 0.5);
+      abs(k - r) < 0.05 ? sprintf(#gui_s, "%.0fk", k) : sprintf(#gui_s, "%.1fk", k);
+    ) : (
+      sprintf(#gui_s, "%.1fk", k);
+    );
+  ) : (
+    sprintf(#gui_s, "%.0f Hz", val);
+  );
+);
+
+function gui_paint_bg() (
+  gfx_r = 28/255; gfx_g = 29/255; gfx_b = 31/255; gfx_a = 1;
+  gfx_rect(0, 0, gfx_w, gfx_h);
+  gui_c_bg();
+  gfx_rect(gui_ox, gui_oy, gui_S(780), gui_S(290));
+  gui_c_panel();
+  gfx_rect(gui_ox, gui_oy, gui_S(780), gui_S(26));
+  gui_c_line();
+  gfx_line(gui_ox, gui_oy + gui_S(26), gui_ox + gui_S(780), gui_oy + gui_S(26), 0);
+  gfx_line(gui_X(156), gui_Y(32), gui_X(156), gui_Y(276), 0);
+  gfx_line(gui_X(606), gui_Y(32), gui_X(606), gui_Y(276), 0);
+);
+function gui_paint_power() (
+  s_device > 0.5 ? (
+    gui_c_orange();
+    gfx_circle(r_pow_x, r_pow_y, r_pow_r, 1, 1);
+  ) : (
+    gui_c_knob();
+    gfx_circle(r_pow_x, r_pow_y, r_pow_r, 1, 1);
+    gui_c_dim();
+    gfx_circle(r_pow_x, r_pow_y, r_pow_r, 0, 1);
+  );
+  gui_c_text();
+  gfx_setfont(2);
+  gfx_x = gui_X(30);
+  gfx_y = gui_Y(4);
+  gfx_drawstr("Vocoder");
+);
+function gui_paint_pad() local(dx, dy, rad, span) (
+  gui_c_screen();
+  gfx_rect(r_pad_x, r_pad_y, r_pad_w, r_pad_h);
+  gui_c_line();
+  gui_box(r_pad_x, r_pad_y, r_pad_w, r_pad_h);
+  gui_c_dim();
+  gfx_a = 0.28;
+  gfx_line(r_pad_x + r_pad_w * 0.5, r_pad_y + gui_S(3), r_pad_x + r_pad_w * 0.5, r_pad_y + r_pad_h - gui_S(3), 0);
+  gfx_line(r_pad_x + gui_S(3), r_pad_y + r_pad_h * 0.5, r_pad_x + r_pad_w - gui_S(3), r_pad_y + r_pad_h * 0.5, 0);
+  gfx_a = 1;
+  gui_c_dim();
+  gfx_setfont(3);
+  sprintf(#gui_s, "Crackle %.2f", max(0, min(1, s_ncrack)));
+  gfx_x = r_pad_x + gui_S(4);
+  gfx_y = r_pad_y + gui_S(3);
+  gfx_drawstr(#gui_s);
+  sprintf(#gui_s, "Rate %.2f", max(0, min(1, s_nrate)));
+  gfx_x = r_pad_x + gui_S(4);
+  gfx_y = r_pad_y + r_pad_h - gui_fm - gui_S(3);
+  gfx_drawstr(#gui_s);
+  rad = max(3, gui_S(4.5));
+  span = rad + gui_S(2);
+  dx = r_pad_x + span + max(0, min(1, s_nrate)) * max(1, r_pad_w - span * 2);
+  dy = r_pad_y + span + (1 - max(0, min(1, s_ncrack))) * max(1, r_pad_h - span * 2);
+  gui_c_knob();
+  gfx_circle(dx, dy, rad, 1, 1);
+  gui_c_teal();
+  gfx_circle(dx, dy, max(2, rad * 0.62), 1, 1);
+);
+function gui_paint_pitch() (
+  gui_name_wave(s_wave);
+  gui_drop(r_wave_x, r_wave_y, r_wave_w, r_wave_h, gui_menu == 3);
+  sprintf(#gui_s, "Pitch");
+  gui_row_l(r_pit_x, r_pit_y, r_pit_w, r_pit_h);
+  gui_fmt_st(s_opitch, 0);
+  gui_row_v(r_pit_x, r_pit_y, r_pit_w, r_pit_h);
+  sprintf(#gui_s, "Low");
+  gui_row_l(r_lo_x, r_lo_y, r_lo_w, r_lo_h);
+  gui_fmt_hz(s_tlow);
+  gui_row_v(r_lo_x, r_lo_y, r_lo_w, r_lo_h);
+  sprintf(#gui_s, "High");
+  gui_row_l(r_hi_x, r_hi_y, r_hi_w, r_hi_h);
+  gui_fmt_hz(s_thigh);
+  gui_row_v(r_hi_x, r_hi_y, r_hi_w, r_hi_h);
+);
+function gui_paint_left() (
+  sprintf(#gui_s, "Carrier");
+  gui_above_l(r_car_x, r_car_y);
+  gui_name_carrier(s_carrier);
+  gui_drop(r_car_x, r_car_y, r_car_w, r_car_h, gui_menu == 1);
+  gui_c_panel();
+  gfx_rect(r_ctx_x, r_ctx_y, r_ctx_w, r_ctx_h);
+  gui_c_line();
+  gui_box(r_ctx_x, r_ctx_y, r_ctx_w, r_ctx_h);
+  s_carrier < 0.5 ? gui_paint_pad() : s_carrier < 1.5 ? (
+    sprintf(#gui_s, "Sidechain: ch 3/4");
+    gui_hint();
+  ) : s_carrier < 2.5 ? (
+    sprintf(#gui_s, "Carrier = modulator");
+    gui_hint();
+  ) : gui_paint_pitch();
+  sprintf(#gui_s, "Enhance");
+  gui_btn(r_enh_x, r_enh_y, r_enh_w, r_enh_h, s_enhance > 0.5);
+  sprintf(#gui_s, "Unvoiced");
+  gui_kcap(r_uv_x, r_uv_y, r_uv_r);
+  gui_knob(r_uv_x, r_uv_y, r_uv_r, gui_linn(s_unvoiced, -96, 0));
+  gui_fmt_db(s_unvoiced, 0);
+  gui_kval(r_uv_x, r_uv_y, r_uv_r);
+  sprintf(#gui_s, "Sens.");
+  gui_above_l(r_sens_x, r_sens_y);
+  gui_fmt_pct(s_sens);
+  gui_num(r_sens_x, r_sens_y, r_sens_w, r_sens_h);
+  s_uvspeed > 0.5 ? sprintf(#gui_s, "Fast") : sprintf(#gui_s, "Slow");
+  gui_btn(r_spd_x, r_spd_y, r_spd_w, r_spd_h, s_uvspeed > 0.5);
+);
+function gui_paint_bands() local(i, x1, x2, w, gap, env, db, t, bh, att, my) (
+  i = 0;
+  gap = gui_nb >= 24 ? 1 : 2;
+  loop(gui_nb,
+    x1 = floor(r_bar_x + i * r_bar_w / gui_nb);
+    x2 = floor(r_bar_x + (i + 1) * r_bar_w / gui_nb);
+    w = x2 - x1 - gap;
+    w < 1 ? w = 1;
+    env = DISP_ENV[i];
+    db = env > 0.000000000001 ? log(env) / DB2A : -120;
+    t = (db + 60) / 60;
+    t < 0 ? t = 0;
+    t > 1 ? t = 1;
+    bh = t * r_bar_h;
+    bh > 0.5 ? (
+      gui_c_teal();
+      gfx_rect(x1, r_bar_y + r_bar_h - bh, w, bh);
+    );
+    att = BAND_ATT[i];
+    att < -60 ? att = -60;
+    att > 0 ? att = 0;
+    my = r_bar_y + r_bar_h * (-att / 60);
+    att < -0.05 ? (
+      gfx_r = 1;
+      gfx_g = 140/255;
+      gfx_b = 24/255;
+      gfx_a = 0.32;
+      my - r_bar_y > 0.5 ? gfx_rect(x1, r_bar_y, w, my - r_bar_y);
+      gfx_a = 1;
+      gui_c_orange();
+      gfx_line(x1, my, x1 + w, my, 0);
+    );
+    i += 1;
+  );
+  gui_menu == 0 && gui_in(r_bar_x, r_bar_y, r_bar_w, r_bar_h) ? (
+    i = gui_band_at(mouse_x);
+    x1 = floor(r_bar_x + i * r_bar_w / gui_nb);
+    x2 = floor(r_bar_x + (i + 1) * r_bar_w / gui_nb);
+    gfx_r = 1; gfx_g = 1; gfx_b = 1; gfx_a = 0.06;
+    gfx_rect(x1, r_bar_y, max(1, x2 - x1 - 1), r_bar_h);
+    gfx_a = 1;
+  );
+);
+function gui_paint_mid() (
+  gui_c_screen();
+  gfx_rect(r_disp_x, r_disp_y, r_disp_w, r_disp_h);
+  gui_c_line();
+  gui_box(r_disp_x, r_disp_y, r_disp_w, r_disp_h);
+  gui_paint_bands();
+  sprintf(#gui_s, "Bands");
+  gui_above_l(r_bnd_x, r_bnd_y);
+  sprintf(#gui_s, "%d", gui_nb);
+  gui_drop(r_bnd_x, r_bnd_y, r_bnd_w, r_bnd_h, gui_menu == 2);
+  sprintf(#gui_s, "Range");
+  gui_above_l(r_rl_x, r_rl_y);
+  gui_fmt_hz(s_low);
+  gui_num(r_rl_x, r_rl_y, r_rl_w, r_rl_h);
+  gui_fmt_hz(s_high);
+  gui_num(r_rh_x, r_rh_y, r_rh_w, r_rh_h);
+  sprintf(#gui_s, "BW");
+  gui_above_l(r_bw_x, r_bw_y);
+  gui_fmt_pct(s_bw);
+  gui_num(r_bw_x, r_bw_y, r_bw_w, r_bw_h);
+  s_fmode > 0.5 ? sprintf(#gui_s, "Retro") : sprintf(#gui_s, "Precise");
+  gui_above_l(r_fm_x, r_fm_y);
+  s_fmode > 0.5 ? sprintf(#gui_s, "Retro") : sprintf(#gui_s, "Precise");
+  gui_btn(r_fm_x, r_fm_y, r_fm_w, r_fm_h, s_fmode > 0.5);
+  sprintf(#gui_s, "Gate");
+  gui_above_l(r_gt_x, r_gt_y);
+  gui_fmt_db(s_gate, 0);
+  gui_num(r_gt_x, r_gt_y, r_gt_w, r_gt_h);
+  sprintf(#gui_s, "Level");
+  gui_above_l(r_lv_x, r_lv_y);
+  gui_fmt_db(s_level, 1);
+  gui_num(r_lv_x, r_lv_y, r_lv_w, r_lv_h);
+);
+function gui_paint_right() (
+  sprintf(#gui_s, "Depth");
+  gui_kcap(r_dp_x, r_dp_y, r_dp_r);
+  gui_knob(r_dp_x, r_dp_y, r_dp_r, gui_linn(s_depth, 0, 200));
+  gui_fmt_pct(s_depth);
+  gui_kval(r_dp_x, r_dp_y, r_dp_r);
+  sprintf(#gui_s, "Mono");
+  gui_btn(r_ch_x, r_ch_y0, r_ch_w, r_ch_h, s_channels < 0.5);
+  sprintf(#gui_s, "Stereo");
+  gui_btn(r_ch_x, r_ch_y1, r_ch_w, r_ch_h, s_channels >= 0.5 && s_channels < 1.5);
+  sprintf(#gui_s, "L/R");
+  gui_btn(r_ch_x, r_ch_y2, r_ch_w, r_ch_h, s_channels >= 1.5);
+  sprintf(#gui_s, "Attack");
+  gui_kcap(r_ak_x, r_ak_y, r_ak_r);
+  gui_knob(r_ak_x, r_ak_y, r_ak_r, gui_logn(s_attack, 0.1, 100));
+  gui_fmt_ms(s_attack, 0);
+  gui_kval(r_ak_x, r_ak_y, r_ak_r);
+  sprintf(#gui_s, "Formant");
+  gui_kcap(r_fo_x, r_fo_y, r_fo_r);
+  gui_knob(r_fo_x, r_fo_y, r_fo_r, gui_linn(s_formant, -12, 12));
+  gui_fmt_st(s_formant, 1);
+  gui_kval(r_fo_x, r_fo_y, r_fo_r);
+  sprintf(#gui_s, "Release");
+  gui_kcap(r_re_x, r_re_y, r_re_r);
+  gui_knob(r_re_x, r_re_y, r_re_r, gui_logn(s_release, 1, 1000));
+  gui_fmt_ms(s_release, 1);
+  gui_kval(r_re_x, r_re_y, r_re_r);
+  sprintf(#gui_s, "Dry/Wet");
+  gui_kcap(r_dw_x, r_dw_y, r_dw_r);
+  gui_knob(r_dw_x, r_dw_y, r_dw_r, gui_linn(s_drywet, 0, 100));
+  gui_fmt_pct(s_drywet);
+  gui_kval(r_dw_x, r_dw_y, r_dw_r);
+);
+function gui_menu_current(j) (
+  gui_menu == 1 ? floor(s_carrier + 0.5) == j : gui_menu == 2 ? floor(s_bands + 0.5) == j : floor(s_wave + 0.5) == j;
+);
+function gui_menu_label(j) (
+  gui_menu == 1 ? gui_name_carrier(j) : gui_menu == 2 ? sprintf(#gui_s, "%d", (j + 1) * 4) : gui_name_wave(j);
+);
+function gui_paint_menu() local(j, iy, hov, cur) (
+  gui_menu <= 0 ? 0 : (
+    gui_menu_geom();
+    gfx_r = 0; gfx_g = 0; gfx_b = 0; gfx_a = 0.4;
+    gfx_rect(gui_mx + gui_S(2), gui_my + gui_S(3), gui_mw, gui_mn * gui_mih);
+    gfx_a = 1;
+    gui_c_panel();
+    gfx_rect(gui_mx, gui_my, gui_mw, gui_mn * gui_mih);
+    gui_c_teal();
+    gui_box(gui_mx, gui_my, gui_mw, gui_mn * gui_mih);
+    j = 0;
+    loop(gui_mn,
+      iy = gui_my + j * gui_mih;
+      hov = mouse_x >= gui_mx && mouse_x < gui_mx + gui_mw && mouse_y >= iy && mouse_y < iy + gui_mih;
+      cur = gui_menu_current(j);
+      hov ? (
+        gui_c_teal();
+        gfx_a = 0.25;
+        gfx_rect(gui_mx + 1, iy, gui_mw - 2, gui_mih);
+        gfx_a = 1;
+      );
+      cur ? (
+        gui_c_orange();
+        gfx_rect(gui_mx + gui_S(2), iy + gui_mih * 0.22, max(2, gui_S(3)), gui_mih * 0.56);
+      );
+      gui_menu_label(j);
+      hov ? gui_c_text() : cur ? gui_c_teal() : gui_c_dim();
+      gfx_setfont(1);
+      gfx_x = gui_mx + gui_S(8);
+      gfx_y = iy;
+      gfx_drawstr(#gui_s, 4, gui_mx + gui_mw - gui_S(4), iy + gui_mih);
+      j += 1;
+    );
+  );
+);
+function gui_paint() (
+  gui_paint_bg();
+  gui_paint_power();
+  gui_paint_left();
+  gui_paint_mid();
+  gui_paint_right();
+  gui_paint_menu();
+);
+
+function gui_frame() (
+  gfx_dest = -1;
+  gfx_mode = 0;
+  gfx_a = 1;
+  gfx_a2 = 1;
+  gui_begin();
+  gui_layout();
+  gui_input();
+  gui_paint();
+  gui_prev_cap = mouse_cap;
+  gui_prev_x = mouse_x;
+  gui_prev_y = mouse_y;
+);
+
+gui_frame();
+

@@ -110,5 +110,12 @@ fi
 cmake -S "$ROOT/tools" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_DIR" --config Release -j
 
+# Second tree: ysfx with LICE gfx, for tools/build/jsfx_gfx_snap.
+# The audio renderer stays linked to the gfx-disabled library above.
+GFX_BUILD="$BUILD_DIR/gfx"
+cmake -S "$ROOT/tools/gfx" -B "$GFX_BUILD" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$GFX_BUILD" --config Release -j
+
 echo "built: $BUILD_DIR/jsfx_render"
+echo "built: $BUILD_DIR/jsfx_gfx_snap"
 echo "python: $VENV/bin/python"
