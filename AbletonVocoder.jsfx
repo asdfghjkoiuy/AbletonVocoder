@@ -1,0 +1,646 @@
+desc: JSFX Live Vocoder (Final GUI Fix)
+// Tags: modulation, vocoder, synthesis
+// Author: Assistant
+
+// --- SLIDER DEFINITIONS ---
+slider1:mode=0<0,3,1{Noise,External (Ch 3/4),Modulator,Pitch Track}>Carrier Source
+slider2:band_idx=3<0,6,1{8,12,16,20,24,28,32}>Bands Selection
+slider3:range_min=100<50,500,1>Min Freq (Hz)
+slider4:range_max=12000<5000,18000,1>Max Freq (Hz)
+slider5:env_att=5<0.1,100,0.1>Attack (ms)
+slider6:env_rel=80<10,500,1>Release (ms)
+slider7:depth_pct=100<0,200,1>Depth (%)
+slider8:formant_shift=0<-12,12,0.1>Formant (Semi)
+slider9:dry_wet=100<0,100,1>Dry/Wet (%)
+slider10:gain_db=0<-24,24,0.1>Level (dB)
+slider11:enhance_on=0<0,1,1>Enhance
+slider12:unvoiced_db=-96<-96,0,1>Unvoiced Level (dB)
+slider13:sens_pct=50<0,100,1>Sensitivity (%)
+slider14:fast_det=0<0,1,1>Fast Detection
+slider15:osc_wave=0<0,2,1{Saw,Sine,Square}>Oscillator Wave
+slider16:bw_pct=100<10,200,1>Bandwidth (%)
+slider17:gate_db=-96<-96,0,1>Gate (dB)
+slider18:plugin_en=1<0,1,1>Plugin Enable
+slider19:precise_mode=1<0,1,1{Retro,Precise}>Filter Mode
+slider20:stereo_mode=1<0,2,1{Mono,Stereo,L/R}>Output Mode
+slider21:width_ms=0<0,250,1>Width (ms)
+slider22:pt_high=1200<100,2000,1>Pitch High (Hz)
+slider23:pt_low=60<10,400,1>Pitch Low (Hz)
+
+@init
+MAX_BANDS = 32;
+PI = 3.14159265359;
+TWO_PI = 2.0 * PI;
+BAND_STRIDE = 100; 
+mem_base = 0;      
+mem_vis = 20000;
+mem_delay = 50000; 
+MAX_DELAY_LEN = 192000; 
+
+memset(0, 0, 100000);
+memset(mem_delay, 0, MAX_DELAY_LEN);
+
+// GUI State
+menu_id = 0; last_cap = 0; last_y = 0; last_x = 0; drag_knob_id = -1; 
+last_click_time = 0; menu_state = 0; 
+
+// DSP State
+pt_smooth = 100; pt_target = 100; osc_phase = 0; osc_env = 0;
+sm_formant = 0; sm_bw = 0;
+uv_hp_state = 0; uv_env = 0; uv_smooth = 0;
+prev_l = 0; prev_r = 0; dc_l = 0; dc_r = 0;
+del_pos = 0; 
+
+// Pitch Tracking State
+pt_track_lp = 0; pt_track_hp = 0; pt_last_val = 0;
+period_samps = 0; pt_gate_state = 0;
+pt_hold_freq = 100; 
+pt_hold_timer = 0;
+
+// DC Blockers
+dc_in_l = 0; prev_in_l = 0;
+dc_in_r = 0; prev_in_r = 0;
+
+silence_timer = 0; is_sleeping = 0;
+
+function poly_blep(t, dt) (
+    t < dt ? ( t /= dt; t + t - t*t - 1.0; ) : 
+    t > 1.0 - dt ? ( t = (t - 1.0) / dt; t*t + t + t + 1.0; ) : 0.0;
+);
+
+@slider
+band_idx == 0 ? n_bands = 8 : band_idx == 1 ? n_bands = 12 : band_idx == 2 ? n_bands = 16 :
+band_idx == 3 ? n_bands = 20 : band_idx == 4 ? n_bands = 24 : band_idx == 5 ? n_bands = 28 : n_bands = 32;
+
+// T60 matched time constants
+safe_att = max(0.1, env_att);
+att_coeff = exp(-1000 / (safe_att * srate)); 
+rel_coeff = exp(-1000 / (max(5, env_rel * 3.0) * srate));
+
+out_gain = 10 ^ (gain_db/20);
+wet_mix = dry_wet / 100; dry_mix = 1 - wet_mix;
+
+depth_factor = depth_pct / 100;
+
+uv_gain = (unvoiced_db <= -90) ? 0 : 10 ^ (unvoiced_db/20);
+sens_thresh = 1 - (sens_pct / 100); 
+target_bw = bw_pct / 100;
+gate_thresh = (gate_db <= -90) ? 0 : 10 ^ (gate_db/20);
+det_att = fast_det ? 0.8 : 0.95; det_rel = fast_det ? 0.8 : 0.98;
+
+vis_decay = 0.85; 
+delay_samples = floor((width_ms * 0.001) * srate);
+
+log_min = log(range_min); log_max = log(range_max); log_range = log_max - log_min;
+init_i = 0;
+loop(n_bands,
+  div = (n_bands > 1) ? (n_bands - 1) : 1;
+  freq = exp(log_min + (init_i / div) * log_range);
+  mem_base[init_i * BAND_STRIDE] = freq;
+  init_i += 1;
+);
+
+// Pitch Track Filter Coeffs
+pt_w_low = 2 * PI * pt_low / srate;
+pt_w_high = 2 * PI * pt_high / srate;
+pt_coeff_hp = exp(-pt_w_low);
+pt_coeff_lp = 1.0 - exp(-pt_w_high);
+
+// Summing Compensation
+band_norm_gain = 12.0 / sqrt(n_bands);
+
+@block
+
+@sample
+plugin_en == 0 ? ( 0; ) : (
+  is_mod_mode = (mode == 2);
+  is_mod_mode ? ( target_formant = 0; actual_uv_gain = 0; ) : ( target_formant = formant_shift; actual_uv_gain = uv_gain; );
+  sm_formant = sm_formant * 0.998 + target_formant * 0.002; 
+  sm_bw      = sm_bw      * 0.998 + target_bw      * 0.002;
+  
+  safe_spl0 = max(-2.0, min(2.0, spl0)); safe_spl1 = max(-2.0, min(2.0, spl1));
+  dc_in_l = safe_spl0 - prev_in_l + 0.999 * dc_in_l; prev_in_l = safe_spl0;
+  dc_in_r = safe_spl1 - prev_in_r + 0.999 * dc_in_r; prev_in_r = safe_spl1;
+  mod_L = dc_in_l; mod_R = dc_in_r; 
+  mod_mono = (mod_L + mod_R) * 0.5; 
+
+  // --- Carrier Generation ---
+  mode == 0 ? ( 
+     nL = (rand(2) - 1) * 0.25; nR = (rand(2) - 1) * 0.25; 
+     car_L = nL; car_R = nR; 
+  ) : mode == 1 ? ( 
+     car_L = spl2; car_R = spl3; 
+  ) : mode == 2 ? ( 
+     car_L = mod_L; car_R = mod_R; 
+  ) : (
+     // --- PITCH TRACKING ---
+     pt_track_lp = pt_track_lp + pt_coeff_lp * (mod_mono - pt_track_lp);
+     pt_clean_sig = pt_track_lp - pt_hp_state + pt_coeff_hp * pt_clean_sig_state;
+     pt_hp_state = pt_track_lp; pt_clean_sig_state = pt_clean_sig;
+
+     (pt_clean_sig > 0 && pt_last_val <= 0) ? (
+         curr_period = period_samps;
+         period_samps = 0;
+         raw_f = srate / curr_period;
+         (raw_f >= pt_low && raw_f <= pt_high) ? (
+             pt_target = raw_f;
+             pt_hold_freq = raw_f; 
+             pt_gate_state = 1; 
+             pt_hold_timer = 0;    
+         ) : (
+             pt_target = pt_hold_freq; 
+         );
+     );
+     pt_last_val = pt_clean_sig;
+     period_samps += 1;
+     pt_gate_state ? ( (period_samps > srate/pt_low * 2.0) ? pt_gate_state = 0; );
+
+     diff = pt_target - pt_smooth;
+     slew_rate = (diff > 0 ? 0.0008 : 0.002) * pt_target; 
+     abs(diff) > slew_rate ? ( pt_smooth += (diff > 0 ? slew_rate : -slew_rate); ) : ( pt_smooth = pt_target; );
+     
+     osc_target_amp = (abs(mod_mono) > 0.001) ? 1.0 : 0.0;
+     osc_env = osc_env * 0.99 + osc_target_amp * 0.01;
+
+     osc_freq = pt_smooth;
+     osc_dt = osc_freq / srate;
+     osc_phase += osc_dt;
+     osc_phase >= 1.0 ? osc_phase -= 1.0;
+     
+     osc_out = 0;
+     osc_wave == 0 ? ( 
+        osc_out = (2.0 * osc_phase - 1.0);
+        osc_out -= poly_blep(osc_phase, osc_dt);
+        osc_out *= -0.7; 
+     ) : 
+     osc_wave == 1 ? ( 
+         osc_out = sin(osc_phase * TWO_PI) * 0.8; 
+     ) : ( 
+         osc_out = (osc_phase < 0.5 ? 1.0 : -1.0);
+         osc_out += poly_blep(osc_phase, osc_dt);
+         ph_shift = osc_phase + 0.5; ph_shift >= 1.0 ? ph_shift -= 1.0;
+         osc_out -= poly_blep(ph_shift, osc_dt);
+         osc_out *= 0.5;
+     );
+     car_L = osc_out * osc_env; car_R = osc_out * osc_env;
+  );
+
+  mem_delay[del_pos] = car_R;
+  rd_pos = del_pos - delay_samples; (rd_pos < 0) ? rd_pos += MAX_DELAY_LEN;
+  car_R_delayed = mem_delay[rd_pos];
+  (width_ms > 0) ? car_R = car_R_delayed;
+  del_pos += 1; (del_pos >= MAX_DELAY_LEN) ? del_pos = 0;
+
+  (abs(mod_mono) < 0.000001 || mod_mono != mod_mono) ? (
+      silence_timer += 1; (silence_timer > srate) ? ( is_sleeping = 1; mod_mono = 0; car_L = 0; car_R = 0; uv_hp_state = 0; );
+  ) : ( silence_timer = 0; is_sleeping = 0; );
+
+  is_sleeping ? (
+      sum_L = 0; sum_R = 0; enh_signal_L = 0; enh_signal_R = 0; uv_signal_L = 0; uv_signal_R = 0;
+      vis_i = 0; loop(n_bands, mem_vis[vis_i] *= vis_decay; (mem_vis[vis_i] < 0.001) ? mem_vis[vis_i] = 0; vis_i += 1; );
+  ) : (
+      uv_cut = 5500; uv_w = 2*PI*uv_cut/srate; uv_k = tan(uv_w/2); uv_norm = 1 / (1 + uv_k);
+      uv_hp_out = (mod_mono - uv_hp_state) * uv_norm; uv_hp_state = uv_hp_state + 2 * uv_hp_out * uv_k;
+      
+      uv_rect = abs(uv_hp_out);
+      uv_env = (uv_rect > uv_env) ? (uv_env * 0.5 + uv_rect * 0.5) : (uv_env * 0.9 + uv_rect * 0.1);
+      is_unvoiced = (uv_env > (sens_thresh * 0.1 + 0.0001)); 
+      
+      uv_signal_L = 0; uv_signal_R = 0;
+      actual_uv_gain > 0 ? (
+         uv_target = is_unvoiced ? 1.0 : 0.0;
+         uv_smooth = uv_smooth * det_rel + uv_target * (1-det_rel);
+         base_noise_l = (rand(2)-1) * 0.7; base_noise_r = (rand(2)-1) * 0.7; 
+         uv_signal_L = base_noise_l * uv_smooth * actual_uv_gain; uv_signal_R = base_noise_r * uv_smooth * actual_uv_gain; 
+      );
+      enh_signal_L = 0; enh_signal_R = 0;
+      enhance_on ? (
+         enh_env = enh_env * 0.9 + abs(uv_hp_out) * 0.1;
+         en_l = (rand(2)-1) * 0.5; en_r = (rand(2)-1) * 0.5;
+         enh_signal_L = en_l * enh_env * 1.5; enh_signal_R = en_r * enh_env * 1.5; 
+      );
+
+      sum_L = 0; sum_R = 0;
+      safe_bw = max(0.1, sm_bw); 
+      shift_factor = 2 ^ (sm_formant / 12);
+
+      dsp_i = 0; 
+      loop_count = (n_bands < 1) ? 8 : n_bands;
+      loop(loop_count,
+        idx = dsp_i * BAND_STRIDE; base_freq = mem_base[idx];
+        is_retro = (precise_mode == 0);
+        
+        max_safe_q = 6.0 + (n_bands / 16.0); raw_q = (n_bands / 3.5) / safe_bw; 
+        is_retro ? ( this_q = min(max_safe_q * 2, raw_q * (1.0 + (dsp_i / n_bands))); retro_gain = 1.0 + (dsp_i / n_bands) * 1.5; ) : ( this_q = min(max_safe_q, raw_q); retro_gain = 1.0; );
+        q_factor = this_q;
+        series_comp_gain = 1.0 / (1.0 + (q_factor * 0.5));
+
+        w0 = 2 * PI * base_freq / srate; sin_w0 = sin(w0); cos_w0 = cos(w0);
+        alpha = sin_w0 / (2 * q_factor); inv_a0 = 1 / (1 + alpha);
+        b0 = alpha * inv_a0; b1 = 0; b2 = -alpha * inv_a0; a1 = -2 * cos_w0 * inv_a0; a2 = (1 - alpha) * inv_a0;
+
+        safe_mod = max(-1.5, min(1.5, mod_mono));
+
+        m_s1 = b0*safe_mod + b1*mem_base[idx+2] + b2*mem_base[idx+3] - a1*mem_base[idx+4] - a2*mem_base[idx+5];
+        mem_base[idx+3] = mem_base[idx+2]; mem_base[idx+2] = safe_mod; 
+        mem_base[idx+5] = mem_base[idx+4]; mem_base[idx+4] = m_s1; 
+        
+        m_s2 = b0*m_s1 + b1*mem_base[idx+6] + b2*mem_base[idx+7] - a1*mem_base[idx+8] - a2*mem_base[idx+9];
+        mem_base[idx+7] = mem_base[idx+6]; mem_base[idx+6] = m_s1; 
+        mem_base[idx+9] = mem_base[idx+8]; mem_base[idx+8] = m_s2;
+
+        det_in = m_s2 * series_comp_gain;
+        pwr = abs(det_in); (pwr < gate_thresh) ? pwr = 0; 
+        
+        curr_env = mem_base[idx+1];
+        (pwr > curr_env) ? ( curr_env = curr_env * att_coeff + pwr * (1 - att_coeff); ) : ( curr_env = curr_env * rel_coeff + pwr * (1 - rel_coeff); );
+        mem_base[idx+1] = curr_env;
+        smooth_env = curr_env;
+        
+        curr_vis = mem_vis[dsp_i]; (smooth_env > curr_vis) ? curr_vis = smooth_env : curr_vis = curr_vis * vis_decay; (curr_vis < 0.0001) ? curr_vis = 0; mem_vis[dsp_i] = curr_vis;
+
+        car_freq = max(40, min(base_freq * shift_factor, srate * 0.45));
+        w0c = 2 * PI * car_freq / srate; sin_w0c = sin(w0c); cos_w0c = cos(w0c);
+        alphac = sin_w0c / (2 * q_factor); inv_a0c = 1 / (1 + alphac);
+        b0c = alphac*inv_a0c; b2c = -alphac*inv_a0c; a1c = -2*cos_w0c*inv_a0c; a2c = (1-alphac)*inv_a0c;
+        safe_car_L = max(-4, min(4, car_L)); safe_car_R = max(-4, min(4, car_R));
+        
+        cl_s1 = b0c*safe_car_L + b2c*mem_base[idx+11] - a1c*mem_base[idx+12] - a2c*mem_base[idx+13];
+        mem_base[idx+11] = mem_base[idx+10]; mem_base[idx+10] = safe_car_L; mem_base[idx+13] = mem_base[idx+12]; mem_base[idx+12] = cl_s1;
+        cl_s2 = b0c*cl_s1 + b2c*mem_base[idx+15] - a1c*mem_base[idx+16] - a2c*mem_base[idx+17];
+        mem_base[idx+15] = mem_base[idx+14]; mem_base[idx+14] = cl_s1; mem_base[idx+17] = mem_base[idx+16]; mem_base[idx+16] = cl_s2;
+
+        cr_s1 = b0c*safe_car_R + b2c*mem_base[idx+21] - a1c*mem_base[idx+22] - a2c*mem_base[idx+23];
+        mem_base[idx+21] = mem_base[idx+20]; mem_base[idx+20] = safe_car_R; mem_base[idx+23] = mem_base[idx+22]; mem_base[idx+22] = cr_s1;
+        cr_s2 = b0c*cr_s1 + b2c*mem_base[idx+25] - a1c*mem_base[idx+26] - a2c*mem_base[idx+27];
+        mem_base[idx+25] = mem_base[idx+24]; mem_base[idx+24] = cr_s1; mem_base[idx+27] = mem_base[idx+26]; mem_base[idx+26] = cr_s2;
+
+        final_env = 0;
+        env_db = (smooth_env > 0.000001) ? log(smooth_env) : -14.0; 
+        scaled_db = env_db * depth_factor;
+        final_env = exp(scaled_db);
+        final_env = min(4.0, final_env);
+
+        gain = final_env * retro_gain * series_comp_gain; 
+        
+        sum_L += cl_s2 * gain; sum_R += cr_s2 * gain;
+        dsp_i += 1;
+      );
+
+      res_L = (sum_L * band_norm_gain) + enh_signal_L + uv_signal_L; 
+      res_R = (sum_R * band_norm_gain) + enh_signal_R + uv_signal_R;
+      
+      dc_l = res_L - prev_l + 0.999 * dc_l; dc_r = res_R - prev_r + 0.999 * dc_r;
+      prev_l = res_L; prev_r = res_R;
+      out_sig_L = max(-4.0, min(4.0, dc_l)); out_sig_R = max(-4.0, min(4.0, dc_r));
+
+      stereo_mode == 0 ? ( mono = (out_sig_L + out_sig_R) * 0.707; out_sig_L = mono; out_sig_R = mono; ) : 
+      stereo_mode == 2 ? ( mid = (out_sig_L + out_sig_R) * 0.5; side = (out_sig_L - out_sig_R) * 0.5; out_sig_L = mid + side * 1.2; out_sig_R = mid - side * 1.2; );
+      
+      spl0 = ((mod_L * dry_mix) + (out_sig_L * wet_mix)) * out_gain;
+      spl1 = ((mod_R * dry_mix) + (out_sig_R * wet_mix)) * out_gain;
+  );
+);
+
+@gfx 780 290
+
+// --- SCALING LOGIC ---
+BASE_W = 780; BASE_H = 290;
+s = min(gfx_w / BASE_W, gfx_h / BASE_H);
+s = max(s, 0.6); 
+
+function col_bg()         ( gfx_r=55/255;  gfx_g=58/255;  gfx_b=60/255;  gfx_a=1; );  
+function col_panel_bg()   ( gfx_r=45/255;  gfx_g=47/255;  gfx_b=49/255;  gfx_a=1; );  
+function col_screen()     ( gfx_r=22/255;  gfx_g=24/255;  gfx_b=26/255;  gfx_a=1; );  
+function col_text_hi()    ( gfx_r=220/255; gfx_g=220/255; gfx_b=220/255; gfx_a=1; );  
+function col_text_lo()    ( gfx_r=160/255; gfx_g=160/255; gfx_b=160/255; gfx_a=1; );  
+function col_orange()     ( gfx_r=255/255; gfx_g=160/255; gfx_b=40/255;  gfx_a=1; );  
+function col_teal()       ( gfx_r=15/255;  gfx_g=210/255; gfx_b=225/255; gfx_a=1; );  
+function col_blue()       ( gfx_r=80/255;  gfx_g=180/255; gfx_b=250/255; gfx_a=1; );  
+function col_knob_ring()  ( gfx_r=25/255;  gfx_g=25/255;  gfx_b=25/255;  gfx_a=1; );  
+
+// Setup Scaled Fonts
+gfx_setfont(1, "Arial", 12 * s); 
+gfx_setfont(2, "Arial", 16 * s, 'b'); 
+gfx_setfont(3, "Arial", 11 * s); 
+gfx_setfont(0);
+
+col_bg(); gfx_rect(0, 0, gfx_w, gfx_h);
+
+mouse_click = (mouse_cap & 1) && !(last_cap & 1);
+mouse_down = (mouse_cap & 1);
+mouse_dbl = (mouse_cap & 1) && (last_cap & 1) == 0 && (time_precise() - last_click_time) < 0.3;
+mouse_click ? last_click_time = time_precise();
+dy = last_y - mouse_y; dx = mouse_x - last_x;
+last_cap = mouse_cap; last_y = mouse_y; last_x = mouse_x;
+!mouse_down ? drag_knob_id = -1;
+
+// --- GLOBAL INTERACTION LOCK ---
+can_interact = (menu_id == 0);
+
+function draw_knob(id, x, y, r, val, min_v, max_v, default_v, slider_idx, title, unit_str, unit_type) (
+  gfx_setfont(3); col_text_hi(); str_w = 0; str_h = 0; gfx_measurestr(title, str_w, str_h);
+  gfx_x = x - str_w/2; gfx_y = y - r - (16 * s); gfx_drawstr(title);
+  col_knob_ring(); gfx_circle(x, y, r, 1);
+  norm_val = (val - min_v) / (max_v - min_v);
+  angle = 0.75 * 3.14 + norm_val * 1.5 * 3.14;
+  ix = x + cos(angle) * (r-2); iy = y + sin(angle) * (r-2);
+  col_teal(); gfx_line(x, y, ix, iy); gfx_line(x+1, y, ix+1, iy);
+  gfx_setfont(3); col_text_hi(); 
+  unit_type == 0 ? sprintf(#s, "%.0f %s", val, unit_str) : unit_type == 1 ? sprintf(#s, "%.1f %s", val, unit_str) : sprintf(#s, "%.2f %s", val, unit_str);
+  gfx_measurestr(#s, str_w, str_h);
+  gfx_x = x - str_w/2; gfx_y = y + r + (5 * s); gfx_drawstr(#s);
+  
+  can_interact ? (
+      hit = mouse_x >= x-r-5 && mouse_x <= x+r+5 && mouse_y >= y-r-5 && mouse_y <= y+r+5;
+      mouse_click && hit ? ( drag_knob_id = id; );
+      hit && mouse_dbl ? ( val = default_v; sliderchange(slider_idx); );
+      drag_knob_id == id ? (
+         scale = (mouse_cap & 4) ? 0.001 : 0.01; range = max_v - min_v;
+         change = dy * range * scale; val = min(max_v, max(min_v, val + change)); sliderchange(slider_idx);
+      );
+  );
+  val;
+);
+
+function draw_num_drag(id, x, y, w, h, val, min_v, max_v, default_v, slider_idx, unit_fmt, use_orange) (
+   hit = mouse_x >= x && mouse_x <= x+w && mouse_y >= y && mouse_y <= y+h;
+   hit ? col_text_hi() : (use_orange ? col_orange() : col_teal()); gfx_x = x; gfx_y = y; 
+   unit_fmt == 0 ? gfx_printf("%.0f %%", val) : unit_fmt == 1 ? gfx_printf("%.1f dB", val) : unit_fmt == 2 ? gfx_printf("%.0f Hz", val) : gfx_printf("%s", val);
+   
+   can_interact ? (
+       mouse_click && hit ? ( drag_knob_id = id; );
+       hit && mouse_dbl ? ( val = default_v; sliderchange(slider_idx); );
+       drag_knob_id == id ? (
+         scale = (mouse_cap & 4) ? 0.001 : 0.01; range = max_v - min_v;
+         change = dy * range * scale; val = min(max_v, max(min_v, val + change)); sliderchange(slider_idx);
+      );
+  );
+  val;
+);
+function draw_box_filled(x, y, w, h, active) (
+  active ? col_orange() : col_panel_bg(); gfx_rect(x, y, w, h);
+  col_knob_ring(); gfx_line(x, y, x+w, y); gfx_line(x+w, y, x+w, y+h); gfx_line(x+w, y+h, x, y+h); gfx_line(x, y+h, x, y);
+);
+function draw_rect_outline(x, y, w, h) (
+  gfx_line(x, y, x+w, y); gfx_line(x+w, y, x+w, y+h); gfx_line(x+w, y+h, x, y+h); gfx_line(x, y+h, x, y);
+);
+
+// --- SCALED LAYOUT ---
+pad = 10 * s;
+base_y = 30 * s;
+L_w = 115 * s; 
+screen_x = L_w + pad;
+screen_w = 500 * s;
+screen_h = 230 * s;
+screen_inner_margin = 10 * s;
+avail_w = screen_w - (screen_inner_margin * 2);
+
+// Header
+col_orange(); gfx_circle(20*s, 15*s, 6*s, 1);
+!plugin_en ? ( col_bg(); gfx_circle(20*s, 15*s, 6*s, 1); col_text_lo(); gfx_circle(20*s, 15*s, 6*s, 0); );
+can_interact && mouse_click && sqrt(sqr(mouse_x-(20*s))+sqr(mouse_y-(15*s))) < 8*s ? ( plugin_en = !plugin_en; sliderchange(slider18); );
+col_text_hi(); gfx_setfont(2); gfx_x = 35*s; gfx_y = 8*s; gfx_drawstr("Vocoder");
+
+// Left - Carrier
+cx = 10*s; cy = base_y + 15*s; cw = 100*s; ch = 18*s;
+gfx_setfont(1); col_text_hi(); gfx_x = cx; gfx_y = cy - 15*s; gfx_drawstr("Carrier");
+col_panel_bg(); gfx_rect(cx, cy, cw, ch); col_text_lo(); draw_rect_outline(cx, cy, cw, ch);
+btn_ex = cx + 55*s; 
+draw_box_filled(btn_ex, cy-14*s, 45*s, 13*s, enhance_on);
+col_text_lo(); draw_rect_outline(btn_ex, cy-14*s, 45*s, 13*s);
+col_text_hi(); enhance_on ? col_bg(); gfx_setfont(3); gfx_x = btn_ex + 2*s; gfx_y = cy - 14*s; gfx_drawstr("Enhance"); 
+can_interact && mouse_click && mouse_x >= btn_ex && mouse_x <= btn_ex+45*s && mouse_y >= cy-14*s && mouse_y <= cy-1*s ? ( enhance_on = !enhance_on; sliderchange(slider11); );
+
+col_text_hi(); enhance_on ? col_text_hi() : col_bg(); gfx_x = cx + 4*s; gfx_y = cy + 2*s;
+col_text_hi(); gfx_setfont(1);
+mode == 0 ? gfx_drawstr("Noise") : mode == 1 ? gfx_drawstr("External") : mode == 2 ? gfx_drawstr("Modulator") : gfx_drawstr("Pitch Track"); 
+gfx_x = cx + cw - 12*s; gfx_drawstr("v");
+
+mode == 3 ? (
+  cy2 = cy + 22*s; col_panel_bg(); gfx_rect(cx, cy2, cw, ch); col_text_lo(); draw_rect_outline(cx, cy2, cw, ch);
+  col_text_hi(); gfx_x = cx + 4*s; gfx_y = cy2 + 2*s;
+  osc_wave == 0 ? gfx_drawstr("Saw") : osc_wave == 1 ? gfx_drawstr("Sine") : gfx_drawstr("Square");
+  gfx_x = cx + cw - 12*s; gfx_drawstr("v");
+);
+
+// --- CLEAR OLD HITS ---
+hit_carrier = 0; hit_osc = 0; hit_bands = 0;
+
+// Detect Carrier
+hit_carrier = mouse_x >= cx && mouse_x <= cx+cw && mouse_y >= cy && mouse_y <= cy+ch;
+mode == 3 ? ( hit_osc = mouse_x >= cx && mouse_x <= cx+cw && mouse_y >= cy2 && mouse_y <= cy2+ch; );
+
+// --- LEFT ALIGNMENT CALCULATIONS ---
+uv_y = base_y + 155*s; 
+unvoiced_db = draw_knob(10, 30*s, uv_y, 12*s, unvoiced_db, -96, 0, -96, slider12, "Unvoiced", "dB", 2);
+
+// Width Knob
+width_y = base_y + 90*s; 
+width_ms = draw_knob(15, 30*s, width_y, 12*s, width_ms, 0, 250, 0, slider21, "Width", "ms", 0);
+
+// NEW: Pitch Low/High NUMERIC BOXES - MOVED UP TO ALIGN
+pt_x_base = 75*s; 
+pt_y_base = width_y - 28*s; // Shifted up so "Low" box is parallel to Width Knob
+
+// Low
+gfx_setfont(3); col_text_hi();
+gfx_x = pt_x_base; gfx_y = pt_y_base; gfx_drawstr("Low");
+col_panel_bg(); gfx_rect(pt_x_base, pt_y_base+12*s, 40*s, 15*s);
+col_teal(); pt_low = draw_num_drag(16, pt_x_base+2*s, pt_y_base+14*s, 38*s, 13*s, pt_low, 10, 400, 60, slider23, 2, 0);
+
+// High
+gfx_setfont(3); col_text_hi();
+gfx_x = pt_x_base; gfx_y = pt_y_base + 32*s; gfx_drawstr("High");
+col_panel_bg(); gfx_rect(pt_x_base, pt_y_base+44*s, 40*s, 15*s);
+col_teal(); pt_high = draw_num_drag(17, pt_x_base+2*s, pt_y_base+46*s, 38*s, 13*s, pt_high, 100, 2000, 1200, slider22, 2, 0);
+
+
+sens_x = 75*s; 
+sens_title_y = uv_y - 28*s;
+sens_box_y = sens_title_y + 12*s;
+
+gfx_setfont(3); col_text_hi();
+gfx_x = sens_x; gfx_y = sens_title_y; gfx_drawstr("Sens.");
+col_panel_bg(); gfx_rect(sens_x, sens_box_y, 40*s, 15*s);
+col_teal(); sens_pct = draw_num_drag(11, sens_x+2*s, sens_box_y+2*s, 38*s, 13*s, sens_pct, 0, 100, 50, slider13, 0, 0);
+
+btn_fx = sens_x; 
+btn_fy = uv_y + 14*s; 
+
+draw_box_filled(btn_fx, btn_fy, 40*s, 15*s, fast_det);
+col_text_hi(); fast_det ? col_bg(); gfx_setfont(3); gfx_x = btn_fx + 8*s; gfx_y = btn_fy + 2*s; gfx_drawstr("Fast");
+can_interact && mouse_click && mouse_x >= btn_fx && mouse_x <= btn_fx+40*s && mouse_y >= btn_fy && mouse_y <= btn_fy+15*s ? ( fast_det = !fast_det; sliderchange(slider14); );
+
+// Center Screen
+col_screen(); gfx_rect(screen_x, base_y, screen_w, screen_h);
+
+// --- Blue Corner Brackets ---
+col_blue();
+cl = 10 * s; 
+gfx_line(screen_x, base_y, screen_x + cl, base_y);
+gfx_line(screen_x, base_y, screen_x, base_y + cl);
+// Top Right
+gfx_line(screen_x + screen_w, base_y, screen_x + screen_w - cl, base_y);
+gfx_line(screen_x + screen_w, base_y, screen_x + screen_w, base_y + cl);
+// Bottom Left
+gfx_line(screen_x, base_y + screen_h, screen_x + cl, base_y + screen_h);
+gfx_line(screen_x, base_y + screen_h, screen_x, base_y + screen_h - cl);
+// Bottom Right (FIXED)
+gfx_line(screen_x + screen_w, base_y + screen_h, screen_x + screen_w - cl, base_y + screen_h);
+gfx_line(screen_x + screen_w, base_y + screen_h, screen_x + screen_w, base_y + screen_h - cl);
+
+col_teal(); 
+gfx_i = 0;
+
+// UPDATE: PERFECT FIT CALCULATION
+vis_x_start = screen_x + screen_inner_margin;
+vis_total_width = screen_w - (2 * screen_inner_margin);
+
+loop(n_bands,
+   val = mem_vis[gfx_i]; 
+   max_h = screen_h - 60*s;
+   h = min(1, pow(val * 4, 0.5)) * max_h;
+   bottom_limit = base_y + screen_h - 40*s; 
+   
+   x1 = vis_x_start + (gfx_i * vis_total_width) / n_bands;
+   x2 = vis_x_start + ((gfx_i + 1) * vis_total_width) / n_bands;
+   
+   draw_x = floor(x1);
+   draw_w = floor(x2) - draw_x - 1; 
+
+   gfx_rect(draw_x, bottom_limit - h, draw_w, h); 
+   gfx_i += 1;
+);
+
+fy = base_y + screen_h - 40*s;
+gfx_setfont(3); col_text_lo(); gfx_x = screen_x + 10*s; gfx_y = fy; gfx_drawstr("Bands");
+
+// --- BANDS BUTTON ---
+bx = screen_x + 10*s; by = fy + 12*s; bw = 40*s; bh = 15*s;
+col_panel_bg(); gfx_rect(bx, by, bw, bh); 
+col_teal(); draw_rect_outline(bx, by, bw, bh);
+col_text_hi(); gfx_x = bx + 5*s; gfx_y = by + 2*s; gfx_printf("%d", n_bands);
+gfx_x = bx + bw - 10*s; gfx_drawstr("v");
+
+// Detect Bands Hit
+hit_bands = mouse_x >= bx && mouse_x <= bx+bw && mouse_y >= by && mouse_y <= by+bh;
+
+col_text_lo(); gfx_x = screen_x + 60*s; gfx_y = fy; gfx_drawstr("Range");
+
+// --- FIXED: DRAGGABLE RANGE NUMBERS ---
+range_max = draw_num_drag(20, screen_x + 60*s, fy + 12*s, 50*s, 12*s, range_max, 5000, 18000, 12000, slider4, 2, 0);
+range_min = draw_num_drag(21, screen_x + 60*s, fy + 24*s, 50*s, 12*s, range_min, 50, 500, 100, slider3, 2, 0);
+
+col_text_lo(); gfx_x = screen_x + 130*s; gfx_y = fy; gfx_drawstr("BW");
+col_teal(); bw_pct = draw_num_drag(12, screen_x + 130*s, fy + 12*s, 40*s, 12*s, bw_pct, 10, 200, 100, slider16, 0, 0);
+
+prec_x = screen_x + 130*s; // Same X as BW
+prec_y = fy + 24*s;
+draw_box_filled(prec_x, prec_y, 45*s, 13*s, precise_mode);
+col_text_hi(); precise_mode ? col_bg(); gfx_setfont(3); gfx_x = prec_x + 4*s; gfx_y = prec_y + 1*s; 
+precise_mode ? gfx_drawstr("Precise") : gfx_drawstr("Retro");
+can_interact && mouse_click && mouse_x >= prec_x && mouse_x <= prec_x+45*s && mouse_y >= prec_y && mouse_y <= prec_y+13*s ? ( precise_mode = !precise_mode; sliderchange(slider19); );
+
+col_text_lo(); gfx_x = screen_x + 190*s; gfx_y = fy; gfx_drawstr("Gate");
+gate_db = draw_num_drag(13, screen_x + 190*s, fy + 12*s, 40*s, 12*s, gate_db, -96, 0, -96, slider17, 1, 1);
+
+col_text_lo(); gfx_x = screen_x + 250*s; gfx_y = fy; gfx_drawstr("Level");
+gain_db = draw_num_drag(14, screen_x + 250*s, fy + 12*s, 40*s, 12*s, gain_db, -24, 24, 0, slider10, 1, 1);
+
+// Right
+rx = screen_x + screen_w + pad; 
+depth_pct = draw_knob(1, rx+20*s, base_y+20*s, 14*s, depth_pct, 0, 200, 100, slider7, "Depth", "%", 2);
+sx = rx + 75*s; sy = base_y;
+
+draw_box_filled(sx, sy, 45*s, 15*s, stereo_mode==0); col_text_lo(); draw_rect_outline(sx, sy, 45*s, 15*s);
+col_text_hi(); stereo_mode == 0 ? col_bg(); gfx_setfont(3); gfx_x = sx+8*s; gfx_y = sy+2*s; gfx_drawstr("Mono"); 
+can_interact && mouse_click && mouse_x >= sx && mouse_x <= sx+45*s && mouse_y >= sy && mouse_y <= sy+15*s ? ( stereo_mode = 0; sliderchange(slider20); );
+sy += 18*s;
+draw_box_filled(sx, sy, 45*s, 15*s, stereo_mode==1); col_text_lo(); draw_rect_outline(sx, sy, 45*s, 15*s);
+col_text_hi(); stereo_mode == 1 ? col_bg(); gfx_x = sx+5*s; gfx_y = sy+2*s; gfx_drawstr("Stereo"); 
+can_interact && mouse_click && mouse_x >= sx && mouse_x <= sx+45*s && mouse_y >= sy && mouse_y <= sy+15*s ? ( stereo_mode = 1; sliderchange(slider20); );
+sy += 18*s;
+draw_box_filled(sx, sy, 45*s, 15*s, stereo_mode==2); col_text_lo(); draw_rect_outline(sx, sy, 45*s, 15*s);
+col_text_hi(); stereo_mode == 2 ? col_bg(); gfx_x = sx+12*s; gfx_y = sy+2*s; gfx_drawstr("L/R"); 
+can_interact && mouse_click && mouse_x >= sx && mouse_x <= sx+45*s && mouse_y >= sy && mouse_y <= sy+15*s ? ( stereo_mode = 2; sliderchange(slider20); );
+
+formant_shift = draw_knob(4, rx+90*s, base_y+100*s, 14*s, formant_shift, -12, 12, 0, slider8, "Formant", "", 1);
+env_att = draw_knob(2, rx+20*s, base_y+100*s, 14*s, env_att, 0.1, 100, 5, slider5, "Attack", "ms", 1);
+env_rel = draw_knob(3, rx+20*s, base_y+180*s, 14*s, env_rel, 1, 500, 80, slider6, "Release", "ms", 1);
+dry_wet = draw_knob(5, rx+90*s, base_y+180*s, 14*s, dry_wet, 0, 100, 100, slider9, "Drv/Wet", "%", 2);
+
+// --- MENU ACTIVATION ---
+(menu_id == 0 && can_interact && mouse_click) ? (
+  hit_carrier ? ( menu_id = 1; menu_state = 1; mouse_click = 0; ); 
+  hit_bands ?   ( menu_id = 2; menu_state = 1; mouse_click = 0; );
+  hit_osc ?     ( menu_id = 3; menu_state = 1; mouse_click = 0; );
+);
+
+// --- MENU DRAWING LOGIC ---
+(menu_id > 0) ? (
+  (menu_state == 1 && !mouse_down) ? menu_state = 2;
+
+  m_h = 20 * s; // Scaled menu item height
+  
+  mx=0; my=0; mw=0; mh=0; count=0;
+  
+  menu_id == 1 ? ( mx=cx; my=cy; mw=cw; mh=ch; count=4; );
+  menu_id == 2 ? ( mx=bx; my=by; mw=50*s; mh=bh; count=7; ); 
+  menu_id == 3 ? ( mx=cx; my=cy2; mw=cw; mh=ch; count=3; );
+  
+  total_h = count * m_h;
+  
+  // --- UPWARD/DOWNWARD LOGIC ---
+  menu_start_y = 0;
+  (menu_id == 2) ? (
+     menu_start_y = my - total_h - (2*s); 
+  ) : (
+     menu_start_y = my + mh + (2*s);
+  );
+
+  col_bg(); gfx_rect(mx, menu_start_y, mw, total_h);
+  col_text_lo(); draw_rect_outline(mx, menu_start_y, mw, total_h);
+  
+  menu_hit = mouse_x >= mx && mouse_x <= mx+mw && mouse_y >= menu_start_y && mouse_y <= menu_start_y + total_h;
+  (menu_state == 2 && mouse_click && !menu_hit) ? ( menu_id = 0; mouse_click = 0; );
+
+  j = 0;
+  loop(count, 
+     iy = menu_start_y + (j * m_h);
+     
+     // Highlight Hover
+     mouse_x > mx && mouse_x < mx+mw && mouse_y >= iy && mouse_y < iy + m_h ? ( 
+         col_blue(); gfx_rect(mx, iy, mw, m_h); 
+         (menu_state == 2 && mouse_click) ? (
+            menu_id == 1 ? ( mode = j; sliderchange(slider1); );
+            menu_id == 2 ? ( 
+                band_idx = j; sliderchange(slider2); 
+                band_idx == 0 ? n_bands = 8 : band_idx == 1 ? n_bands = 12 : band_idx == 2 ? n_bands = 16 :
+                band_idx == 3 ? n_bands = 20 : band_idx == 4 ? n_bands = 24 : band_idx == 5 ? n_bands = 28 : n_bands = 32;
+            );
+            menu_id == 3 ? ( osc_wave = j; sliderchange(slider15); );
+            menu_id = 0; 
+            mouse_click = 0;
+         );
+     );
+
+     // Text Drawing
+     gfx_setfont(1); 
+     mouse_x > mx && mouse_x < mx+mw && mouse_y >= iy && mouse_y < iy + m_h ? col_text_hi() : col_text_lo();
+     gfx_x = mx + 5*s; gfx_y = iy + 5*s;
+
+     (menu_id == 1) ? ( 
+        j==0?gfx_drawstr("Noise"):j==1?gfx_drawstr("External"):j==2?gfx_drawstr("Modulator"):j==3?gfx_drawstr("Pitch Track"); 
+     );
+     (menu_id == 2) ? ( 
+        j==0?v=8:j==1?v=12:j==2?v=16:j==3?v=20:j==4?v=24:j==5?v=28:v=32; 
+        gfx_printf("%d", v); 
+     );
+     (menu_id == 3) ? (
+        j==0?gfx_drawstr("Saw"):j==1?gfx_drawstr("Sine"):gfx_drawstr("Square"); 
+     );
+
+     j += 1;
+  );
+);
