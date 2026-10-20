@@ -1,0 +1,14 @@
+desc: Silence output (metric fixture)
+// Ignores the input and writes exact zeros. Used to check the renderer
+// and the NaN/peak scan.
+
+in_pin:Modulator L
+in_pin:Modulator R
+in_pin:Carrier L (sidechain)
+in_pin:Carrier R (sidechain)
+out_pin:Output L
+out_pin:Output R
+
+@sample
+spl0 = 0;
+spl1 = 0;

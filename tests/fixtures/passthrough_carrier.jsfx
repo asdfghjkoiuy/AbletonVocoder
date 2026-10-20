@@ -1,0 +1,14 @@
+desc: Carrier passthrough (metric fixture)
+// Copies sidechain channels 3/4 to the output. Used to check that the
+// flatness measurement reads ~0 dB of ripple on a known-flat path.
+
+in_pin:Modulator L
+in_pin:Modulator R
+in_pin:Carrier L (sidechain)
+in_pin:Carrier R (sidechain)
+out_pin:Output L
+out_pin:Output R
+
+@sample
+spl0 = spl2;
+spl1 = spl3;

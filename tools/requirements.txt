@@ -1,0 +1,6 @@
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1
+# scipy is installed because the harness spec asks for it. The 1.15.3
+# macosx_14_0_arm64 wheel does not dlopen here (darwin 27 rejects
+# __DATA/__thread_bss). signals.py and suite.py use numpy only.

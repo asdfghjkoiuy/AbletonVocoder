@@ -2,5 +2,7 @@ tools/build/
 tools/ysfx/
 tools/.venv/
 tests/out/
+tests/signals/
 __pycache__/
+*.pyc
 .DS_Store
