@@ -159,6 +159,9 @@ ENH_REL = exp(-60 * DB2A);
 ENH_ABS = exp(-100 * DB2A);
 ENH_KNEE = exp(12 * DB2A);
 ENH_KNEE_LOG = 12 * DB2A;
+ENH_KNEE_M1 = ENH_KNEE - 1;
+// 1/ln(knee). The 12 dB knee stays log-domain; enh_boost builds ln via atanh.
+ENH_INV_LOG = 1 / ENH_KNEE_LOG;
 // Enhance-off broadband trims. Measured with a -18 dBFS speech modulator,
 // 20 bands, Precise, Depth 100%, Enhance off, so the output lands on the
 // input: noise at default Rate/Crackle, a -18 dBFS saw chord, the speech
@@ -182,14 +185,34 @@ memset(0, 0, HI + 48 * MAXB);
 
 pt_target = 100;
 pt_log = log(100);
+pt_log_src = 100;
+pt_log_tgt = pt_log;
 pt_have = 0;
 osc_phase = 0;
 boot = 1;
 active_carrier = -1;
 active_ch = -1;
+tgt_carrier = 0;
+tgt_ch = 1;
 duck = 1;
 duck_target = 1;
-design_sig = -1;
+// Per-control design key. A packed linear hash collides: +1000 Hz on the
+// top of the range and -1 Hz on the bottom land on the same number.
+prev_n_tgt = -1;
+prev_flo = -1;
+prev_fhi = -1;
+prev_bw = -1;
+prev_retro = -1;
+prev_srate = -1;
+car_link_ok = 1;
+syn_linked = 1;
+asleep = 0;
+sil_hold = 0;
+env_ph = 0;
+sil_need = 2048;
+coef_busy = 1;
+lp_fc_set = -1;
+param_dirty = 1;
 uv_env = 0;
 formant_sm = 0;
 enh_mix = 0;
@@ -468,13 +491,16 @@ function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(
   solve_flat();
 );
 
-function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio) global(o_a1, o_a2, o_a3, o_k, srate, samplesblock, boot, formant_sm, s_formant, LN2, COEF, CSTR, MAXB, n_bands) (
+function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio, d, busy) global(o_a1, o_a2, o_a3, o_k, srate, samplesblock, boot, formant_sm, s_formant, LN2, COEF, CSTR, MAXB, n_bands, coef_busy) (
   a = 1 - exp(-samplesblock / (0.02 * srate));
   a > 1 ? a = 1;
   boot ? formant_sm = s_formant : (
     formant_sm += (1 - exp(-samplesblock / (0.012 * srate))) * (s_formant - formant_sm);
   );
+  abs(formant_sm - s_formant) < 0.0001 ? formant_sm = s_formant;
   form_ratio = exp(formant_sm * LN2 / 12);
+  busy = 0;
+  formant_sm != s_formant ? busy = 1;
   bi = 0;
   loop(MAXB,
     cf = COEF + bi * CSTR;
@@ -486,10 +512,14 @@ function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio) global(
       amix = bi < n_bands ? 1 : 0;
       cf[20] = amix;
     ) : (
-      cf[0] += a * (cf[1] - cf[0]);
-      cf[2] += a * (cf[3] - cf[2]);
-      cf[4] += a * (cf[5] - cf[4]);
-      cf[6] += a * (cf[7] - cf[6]);
+      d = cf[1] - cf[0];
+      abs(d) < 0.00001 ? cf[0] = cf[1] : (cf[0] += a * d; busy = 1);
+      d = cf[3] - cf[2];
+      abs(d) < 0.00001 ? cf[2] = cf[3] : (cf[2] += a * d; busy = 1);
+      d = cf[5] - cf[4];
+      abs(d) < 0.00001 ? cf[4] = cf[5] : (cf[4] += a * d; busy = 1);
+      d = cf[7] - cf[6];
+      abs(d) < 0.00001 ? cf[6] = cf[7] : (cf[6] += a * d; busy = 1);
     );
     fc = exp(cf[0]);
     qq = cf[2];
@@ -503,9 +533,9 @@ function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio) global(
     svf_set(fcs, qq);
     cf[16] = o_a1; cf[17] = o_a2; cf[18] = o_a3; cf[19] = o_k;
     cf[21] = fc;
-    bi < n_bands ? 0 : 0;
     bi += 1;
   );
+  coef_busy = busy;
 );
 
 // Two cascaded unity-peak TPT bandpasses. Coeffs are c_a1..c_k.
@@ -580,18 +610,23 @@ function depth_gain(env, inv_vr) local(go, gn, b) global(depth_mode, INV_REF_DEN
   go * (1 - enh_mix) + gn * enh_mix;
 );
 
-function enh_boost(rms) local(flo, boost, hi, t, s)
-global(enh_peak, enh_seen, ENH_REL, ENH_ABS, ENH_KNEE, ENH_KNEE_LOG, NOMINAL) (
+// 12 dB log-domain smoothstep, without log(). enh_flo / enh_hi / enh_span are
+// constant for the whole sample (they track enh_peak, not enh_seen).
+// u = (rms - flo) / (hi - flo) is the linear position in the knee.
+// t = ln(rms/flo) / ln(knee) comes back from the atanh series of that ratio.
+function enh_boost(rms) local(boost, u, z, z2, t, s)
+global(enh_seen, enh_flo, enh_hi, enh_span, ENH_KNEE_M1, ENH_INV_LOG, NOMINAL) (
   rms > enh_seen ? enh_seen = rms;
-  flo = enh_peak * ENH_REL;
-  flo < ENH_ABS ? flo = ENH_ABS;
-  rms < flo ? (
+  rms < enh_flo ? (
     0;
   ) : (
     boost = NOMINAL / rms;
-    hi = flo * ENH_KNEE;
-    rms < hi ? (
-      t = log(rms / flo) / ENH_KNEE_LOG;
+    rms < enh_hi ? (
+      u = (rms - enh_flo) / enh_span;
+      z = (u * ENH_KNEE_M1) / (2 + u * ENH_KNEE_M1);
+      z2 = z * z;
+      t = 2 * z * (1 + z2 * (0.3333333333333333 + z2 * (0.2 + z2 * 0.14285714285714285)));
+      t *= ENH_INV_LOG;
       t < 0 ? t = 0;
       t > 1 ? t = 1;
       s = t * t * (3 - 2 * t);
@@ -601,7 +636,7 @@ global(enh_peak, enh_seen, ENH_REL, ENH_ABS, ENH_KNEE, ENH_KNEE_LOG, NOMINAL) (
   );
 );
 
-function synth_sample(st, x) local(y, yp, hp, rms, boost, hi, t, s) global(enh_mix, enh_att, enh_rel, NOMINAL, ENH_ABS, ENH_KNEE, ENH_KNEE_LOG) (
+function synth_sample(st, x) local(y, yp, hp, rms, boost, hi, t, s, u, z, z2) global(enh_mix, enh_att, enh_rel, NOMINAL, ENH_ABS, ENH_KNEE, ENH_KNEE_M1, ENH_INV_LOG) (
   y = svf2(st, x);
   enh_mix > 0.0005 ? (
     yp = y * y;
@@ -616,7 +651,11 @@ function synth_sample(st, x) local(y, yp, hp, rms, boost, hi, t, s) global(enh_m
       boost = NOMINAL / rms;
       hi = ENH_ABS * ENH_KNEE;
       rms < hi ? (
-        t = log(rms / ENH_ABS) / ENH_KNEE_LOG;
+        u = (rms - ENH_ABS) / (hi - ENH_ABS);
+        z = (u * ENH_KNEE_M1) / (2 + u * ENH_KNEE_M1);
+        z2 = z * z;
+        t = 2 * z * (1 + z2 * (0.3333333333333333 + z2 * (0.2 + z2 * 0.14285714285714285)));
+        t *= ENH_INV_LOG;
         t < 0 ? t = 0;
         t > 1 ? t = 1;
         s = t * t * (3 - 2 * t);
@@ -669,16 +708,18 @@ function yin_run() local(frame, w, tau_min, tau_max, start, j, tau, xj, xt, s1, 
       best = tau_min;
       bestv = 1000000000;
       found = 0;
+      // s2(tau) = s2(tau-1) - y[tau-1]^2 + y[tau+w-1]^2. s2(0) is s1.
+      s2 = s1;
       tau = 1;
       loop(tau_max,
-        s2 = 0;
+        xt = YBUF[tau + w - 1];
+        xj = YBUF[tau - 1];
+        s2 += xt * xt - xj * xj;
+        s2 < 0 ? s2 = 0;
         rr = 0;
         j = 0;
         loop(w,
-          xj = YBUF[j];
-          xt = YBUF[j + tau];
-          s2 += xt * xt;
-          rr += xj * xt;
+          rr += YBUF[j] * YBUF[j + tau];
           j += 1;
         );
         dd = s1 + s2 - 2 * rr;
@@ -693,15 +734,15 @@ function yin_run() local(frame, w, tau_min, tau_max, start, j, tau, xj, xt, s1, 
         tau += 1;
       );
       // One extra lag so parabolic interpolation can look at tau+1.
-      s2 = 0;
+      // tau is already tau_max + 1.
+      xt = YBUF[tau + w - 1];
+      xj = YBUF[tau - 1];
+      s2 += xt * xt - xj * xj;
+      s2 < 0 ? s2 = 0;
       rr = 0;
       j = 0;
-      tau = tau_max + 1;
       loop(w,
-        xj = YBUF[j];
-        xt = YBUF[j + tau];
-        s2 += xt * xt;
-        rr += xj * xt;
+        rr += YBUF[j] * YBUF[j + tau];
         j += 1;
       );
       dd = s1 + s2 - 2 * rr;
@@ -739,8 +780,8 @@ function yin_run() local(frame, w, tau_min, tau_max, start, j, tau, xj, xt, s1, 
 // Mono modulator, Enhance off, Depth 100%, gate open, one carrier sample.
 // cf[23] is inv_sqrt(vr)/REF_LIN. cf[22] is polarity * flatness * retro * n_trim.
 // Band mix and atten still fade per sample, then snap once they arrive.
-function fast_bands() local(bi, cf, fc_hz, b_a1, b_a2, b_a3, b_k, stA, stS, stT, p_ic1, p_ic2, p_v3, p_v1, p_v2, p_bp, p_a2, p_amp, p_ep, dgL, bm, at)
-global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_c, rel_c, GAIN_CAP, modL, carL, sumL, sumR, DISP_ENV, e_all, e_hi, uv_off, bmix_c, att_sm_c)
+function fast_bands() local(bi, cf, fc_hz, b_a1, b_a2, b_a3, b_k, stA, stS, p_ic1, p_ic2, p_v3, p_v1, p_v2, p_bp, p_a2, p_amp, p_ep, dgL, bm, at)
+global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_2, rel_2, env_ph, GAIN_CAP, modL, carL, sumL, sumR, DISP_ENV, e_all, e_hi, uv_off, bmix_c, att_sm_c)
 (
   bi = 0;
   loop(n_bands,
@@ -780,11 +821,17 @@ global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_c, rel_c, GAIN_CAP, modL
     p_bp = b_k * p_v1;
     p_v3 = b_k * p_v2;
     p_a2 = p_bp * p_bp + p_v3 * p_v3;
-    p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
-    p_ep = stA[4];
-    p_amp > p_ep ? (p_ep += att_c * (p_amp - p_ep);) : (p_ep += rel_c * (p_amp - p_ep););
-    p_ep < 0.000000000001 ? p_ep = 0;
-    stA[4] = p_ep;
+    // Envelope at half rate. att_2/rel_2 are the two-sample coefficients, so
+    // the attack and release times stay on the knob.
+    env_ph ? (
+      p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
+      p_ep = stA[4];
+      p_amp > p_ep ? (p_ep += att_2 * (p_amp - p_ep);) : (p_ep += rel_2 * (p_amp - p_ep););
+      p_ep < 0.000000000001 ? p_ep = 0;
+      stA[4] = p_ep;
+    ) : (
+      p_ep = stA[4];
+    );
     uv_off ? 0 : (
       e_all += p_a2;
       fc_hz = cf[21];
@@ -815,19 +862,42 @@ global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_c, rel_c, GAIN_CAP, modL
     stS[3] = p_v2 + p_v2 - p_ic2;
     p_bp = b_k * p_v1;
     sumL += p_bp * dgL * cf[22] * at * bm;
-    // Keep the unused right filter in step, so a little unvoiced noise can
-    // wake it without a stale-state blast. Skipped when Unvoiced is off.
-    uv_off ? 0 : (
-      stT = stS + LANE_STEP;
-      stT[0] = stS[0];
-      stT[1] = stS[1];
-      stT[2] = stS[2];
-      stT[3] = stS[3];
-      stT[7] = stS[7];
-    );
     bi += 1;
   );
   sumR = sumL;
+);
+
+// Drop a lane that is about to start from a frozen state (analysis R when
+// entering L/R). Gate open/gain are left alone so a closed gate stays closed.
+function zero_lane(base) local(bi, st) global(SSTR, MAXB) (
+  bi = 0;
+  loop(MAXB,
+    st = base + bi * SSTR;
+    st[0] = 0;
+    st[1] = 0;
+    st[2] = 0;
+    st[3] = 0;
+    st[4] = 0;
+    st[7] = 0;
+    bi += 1;
+  );
+);
+
+// One copy of the live left synthesis state into the right lane.
+// Used on the sample the right filter starts running on its own.
+function copy_synth_lr() local(bi, stS, stT) global(STATE, SSTR, LANE_STEP, MAXB) (
+  bi = 0;
+  loop(MAXB,
+    stS = STATE + bi * SSTR + LANE_STEP * 2;
+    stT = stS + LANE_STEP;
+    stT[0] = stS[0];
+    stT[1] = stS[1];
+    stT[2] = stS[2];
+    stT[3] = stS[3];
+    stT[4] = stS[4];
+    stT[7] = stS[7];
+    bi += 1;
+  );
 );
 
 // GUI only. Asks the host for a hidpi framebuffer. The audio path never
@@ -848,9 +918,17 @@ gui_asweep = 300 * PI / 180;
 param_dirty = 1;
 
 @block
-n_tgt = (s_bands + 1) * 4;
-n_tgt < 4 ? n_tgt = 4;
-n_tgt > 40 ? n_tgt = 40;
+tgt_carrier = floor(s_carrier + 0.5);
+tgt_ch = floor(s_channels + 0.5);
+tgt_carrier < 0 ? tgt_carrier = 0;
+tgt_carrier > 3 ? tgt_carrier = 3;
+tgt_ch < 0 ? tgt_ch = 0;
+tgt_ch > 2 ? tgt_ch = 2;
+
+n_tgt = floor(s_bands + 0.5);
+n_tgt < 0 ? n_tgt = 0;
+n_tgt > 9 ? n_tgt = 9;
+n_tgt = (n_tgt + 1) * 4;
 bw_pct = s_bw;
 bw_pct < 10 ? bw_pct = 10;
 bw_pct > 200 ? bw_pct = 200;
@@ -858,27 +936,43 @@ flo = s_low;
 fhi = s_high;
 retro_on = s_fmode > 0.5;
 
-sig = n_tgt * 100000 + floor(flo) + floor(fhi) * 0.001 + bw_pct * 17 + retro_on * 333 + floor(srate);
-sig != design_sig ? (
+// Compare each control with the value that last rebuilt the bank.
+// design_targets clamps flo/fhi, so remember the request, not the clamp.
+(n_tgt != prev_n_tgt || flo != prev_flo || fhi != prev_fhi || bw_pct != prev_bw || retro_on != prev_retro || srate != prev_srate) ? (
+  prev_n_tgt = n_tgt;
+  prev_flo = flo;
+  prev_fhi = fhi;
+  prev_bw = bw_pct;
+  prev_retro = retro_on;
+  prev_srate = srate;
   n_bands = n_tgt;
   design_targets();
-  design_sig = sig;
   param_dirty = 1;
+  coef_busy = 1;
 );
 
-// Snap the smoothed design the first time through so tests are not a fade-in.
-smooth_coeffs();
+// svf_set() is a tan() per band, twice. Once the formant slew and the
+// coefficient slew have landed, the cached a1..k stay valid.
+param_dirty || coef_busy || abs(formant_sm - s_formant) > 0.0001 ? (
+  smooth_coeffs();
+  param_dirty = 0;
+) : (
+  formant_sm = s_formant;
+);
 boot ? (
   lvl = exp(s_level * DB2A);
   wet = max(0, min(1, s_drywet * 0.01));
   dev = s_device > 0.5;
   enh_mix = s_enhance > 0.5;
   formant_sm = s_formant;
-  active_carrier = s_carrier;
-  active_ch = s_channels;
+  active_carrier = tgt_carrier;
+  active_ch = tgt_ch;
   duck = 1;
   duck_target = 1;
-  pending_route = 0;
+  car_link_ok = 1;
+  syn_linked = 1;
+  asleep = 0;
+  sil_hold = 0;
   gi = 0;
   loop(MAXB * 4,
     (STATE + gi * SSTR)[5] = 1;
@@ -908,8 +1002,12 @@ att_c = 1 - exp(-1 / (max(s_attack, 0.05) * 0.001 * srate));
 rel_c = 1 - exp(-1 / (max(s_release, 0.2) * 0.001 * srate));
 att_c > 1 ? att_c = 1;
 rel_c > 1 ? rel_c = 1;
+att_2 = 1 - (1 - att_c) * (1 - att_c);
+rel_2 = 1 - (1 - rel_c) * (1 - rel_c);
 enh_att = 1 - exp(-1 / (0.004 * srate));
 enh_rel = 1 - exp(-1 / (0.015 * srate));
+enh_att2 = 1 - (1 - enh_att) * (1 - enh_att);
+enh_rel2 = 1 - (1 - enh_rel) * (1 - enh_rel);
 enh_pk_att = 1 - exp(-1 / (0.001 * srate));
 enh_pk_rel = 1 - exp(-1 / (0.200 * srate));
 gate_c = 1 - exp(-1 / (0.004 * srate));
@@ -924,6 +1022,8 @@ uv_ms_r = s_uvspeed > 0.5 ? 0.0025 : 0.0015;
 uv_att = 1 - exp(-1 / (uv_ms_a * srate));
 uv_rel = 1 - exp(-1 / (uv_ms_r * srate));
 glide_c = 1 - exp(-1 / (0.0025 * srate));
+sil_need = floor(0.05 * srate);
+sil_need < 64 ? sil_need = 64;
 lvl_target = exp(max(-24, min(24, s_level)) * DB2A);
 wet_target = max(0, min(1, s_drywet * 0.01));
 dev_target = s_device > 0.5;
@@ -946,21 +1046,12 @@ uv_lin = uv_off ? 0 : exp(s_unvoiced * DB2A);
 uv_thr = (100 - max(0, min(100, s_sens))) * 0.0084;
 uv_energy_lin = exp(-46 * DB2A);
 
-// Route changes duck the wet path, then swap, so the carrier discontinuity
-// lands while the wet gain is ~0.
-route_changed = (s_carrier != active_carrier || s_channels != active_ch);
-route_changed ? (
-  pending_route = 1;
+// Route changes duck the wet sum (not a crossfade onto the dry input).
+// @sample applies the new route as soon as the duck has landed.
+(tgt_carrier != active_carrier || tgt_ch != active_ch) ? (
   duck_target = 0;
 ) : (
-  pending_route && duck < 0.02 ? (
-    active_carrier = s_carrier;
-    active_ch = s_channels;
-    pending_route = 0;
-    duck_target = 1;
-  ) : (
-    !pending_route ? duck_target = 1;
-  );
+  duck_target = 1;
 );
 
 // Noise sample-and-hold rate. 0 -> 300 Hz, 1 -> full rate, exponential.
@@ -969,17 +1060,23 @@ rate_hz = 300 * exp(nrate * log(srate / 300));
 hold_n = srate / rate_hz;
 hold_n < 1 ? hold_n = 1;
 
-// Pitch decimator ~8-12 kHz, 4th-order lowpass, hop 4 ms.
-decim = 2;
-while ((srate / decim) > 12000) (decim += 1;);
-sr_dec = srate / decim;
-lp_fc = min(4200, 0.40 * sr_dec);
-svf_set(lp_fc, 0.7071);
-lp_a1 = o_a1; lp_a2 = o_a2; lp_a3 = o_a3; lp_k = o_k;
-hop_n = floor(0.004 * sr_dec);
-hop_n < 16 ? hop_n = 16;
+// Pitch decimator. Track High tops out at 2 kHz, so 6 kHz is enough when the
+// ceiling is 1.2 kHz and 8 kHz otherwise. Hop is 5 ms: 6 ms pushed a glide
+// just past the 25 cent median. YIN work is O(W * tau).
 tlow_hz = max(20, min(s_tlow, 1000));
 thigh_hz = max(tlow_hz + 10, min(s_thigh, 2000));
+yin_ceil = thigh_hz <= 1200 ? 6000 : 8000;
+decim = 2;
+while ((srate / decim) > yin_ceil) (decim += 1;);
+sr_dec = srate / decim;
+lp_fc = min(4200, 0.40 * sr_dec);
+lp_fc != lp_fc_set ? (
+  svf_set(lp_fc, 0.7071);
+  lp_a1 = o_a1; lp_a2 = o_a2; lp_a3 = o_a3; lp_k = o_k;
+  lp_fc_set = lp_fc;
+);
+hop_n = floor(0.005 * sr_dec);
+hop_n < 16 ? hop_n = 16;
 yin_gate2 = exp(-50 * DB2A);
 yin_gate2 *= yin_gate2;
 pt_transpose = exp(max(-24, min(24, s_opitch)) * LN2 / 12);
@@ -993,25 +1090,41 @@ n_run = bi;
 // bands. 20 bands is unity, so the TRIM_* levels are unchanged.
 n_trim = exp(-0.40 * log(n_bands / 20) / LN2 * DB2A);
 bi = 0;
-loop(n_bands,
+loop(n_run,
   cf = COEF + bi * CSTR;
-  // Steady trim, and the white-equivalent envelope scale. Fast path only.
+  // Steady trim, and the white-equivalent envelope scale.
   cf[22] = cf[9] * cf[6] * cf[4] * n_trim;
   cf[23] = cf[8] * INV_REF_DENS;
   bi += 1;
 );
 
 @sample
-duck += duck_c * (duck_target - duck);
 lvl += macro_c * (lvl_target - lvl);
 wet += macro_c * (wet_target - wet);
 dev += macro_c * (dev_target - dev);
 enh_mix += macro_c * (enh_target - enh_mix);
+duck += duck_c * (duck_target - duck);
 duck < 0 ? duck = 0;
 duck > 1 ? duck = 1;
+// Swap the route on this sample, while the wet sum is still ducked.
+duck < 0.02 && (active_carrier != tgt_carrier || active_ch != tgt_ch) ? (
+  active_ch != 2 && tgt_ch == 2 ? zero_lane(STATE + LANE_STEP);
+  active_carrier = tgt_carrier;
+  active_ch = tgt_ch;
+  duck_target = 1;
+  car_link_ok = 1;
+  syn_linked = 1;
+);
 
 inL = spl0;
 inR = spl1;
+quiet_in = abs(inL) < 0.0000001 && abs(inR) < 0.0000001;
+asleep && quiet_in ? (
+  spl0 = 0;
+  spl1 = 0;
+) : (
+asleep = 0;
+env_ph = 1 - env_ph;
 
 // Carrier.
 active_carrier == 0 ? (
@@ -1040,7 +1153,11 @@ active_carrier == 0 ? (
   carL = inL;
   carR = inR;
 ) : (
-  pt_log += glide_c * (log(max(pt_target, 1)) - pt_log);
+  pt_target != pt_log_src ? (
+    pt_log_src = pt_target;
+    pt_log_tgt = log(max(pt_target, 1));
+  );
+  pt_log += glide_c * (pt_log_tgt - pt_log);
   osc_dt = exp(pt_log) * pt_transpose / srate;
   osc_dt > 0.45 ? osc_dt = 0.45;
   osc_dt < 0 ? osc_dt = 0;
@@ -1100,12 +1217,36 @@ unity_dg = depth_mode < 0.5;
 fast_enh = depth_mode > 0.5 && depth_mode < 1.5 && enh_mix > 0.999;
 fast_dry = depth_mode > 0.5 && depth_mode < 1.5 && enh_mix < 0.001;
 do_enh = enh_mix > 0.0005;
-ch_mono = active_ch < 0.5;
-ch_lr = active_ch > 1.5;
-// Same carrier sample on both pins: one synthesis filter, two gains.
-car_same = carL == carR;
+ch_mono = (active_ch == 0);
+ch_lr = (active_ch == 2);
+// Mono is a property of the route, not of this sample's carrier values.
+// Noise is independent per channel. Pitch with Unvoiced hard-off is one
+// oscillator. External and Modulator stay on one synthesis filter only
+// while both pins have matched since the last route change: the first
+// difference latches stereo, so a zero or a crackle impulse cannot flip
+// the right-hand state between "copy" and "filter" every sample.
+route_mono = ch_mono || (active_carrier == 3 && uv_off);
+active_carrier == 0 ? (
+  car_link_ok = 0;
+) : (
+  uv_off && active_carrier != 3 && car_link_ok && carL != carR ? car_link_ok = 0;
+);
+car_is_mono = route_mono || (uv_off && car_link_ok && active_carrier > 0 && active_carrier < 3);
+want_link = car_is_mono && !ch_lr;
+syn_linked && !want_link ? (
+  copy_synth_lr();
+  syn_linked = 0;
+);
+want_link ? syn_linked = 1;
+enh_flo = enh_peak * ENH_REL;
+enh_flo < ENH_ABS ? enh_flo = ENH_ABS;
+enh_hi = enh_flo * ENH_KNEE;
+enh_span = enh_hi - enh_flo;
+enh_span < 0.000000000001 ? enh_span = 0.000000000001;
+enh_full = enh_mix > 0.999;
+enh_keep = 1 - enh_mix;
 bi = 0;
-fast_share = fast_dry && gate_off && !ch_lr && !do_enh && (ch_mono || car_same) && n_run == n_bands;
+fast_share = fast_dry && gate_off && !ch_lr && !do_enh && want_link && n_run == n_bands;
 fast_share ? (
   fast_bands();
   enh_peak += enh_pk_rel * (0 - enh_peak);
@@ -1114,13 +1255,19 @@ enh_seen = 0;
 loop(n_run,
   cf = COEF + bi * CSTR;
   bm = cf[20];
-  bm += bmix_c * ((bi < n_bands) - bm);
-  cf[20] = bm;
+  bm_tgt = bi < n_bands;
+  abs(bm - bm_tgt) < 0.000001 ? bm = bm_tgt : (
+    bm += bmix_c * (bm_tgt - bm);
+    cf[20] = bm;
+  );
   at = cf[10];
-  at += att_sm_c * (cf[11] - at);
-  at < 0.000000000001 ? at = 0;
-  cf[10] = at;
-  trim = cf[9] * cf[6] * cf[4] * at * bm * n_trim;
+  at_tgt = cf[11];
+  abs(at - at_tgt) < 0.000001 ? at = at_tgt : (
+    at += att_sm_c * (at_tgt - at);
+    at < 0.000000000001 ? at = 0;
+    cf[10] = at;
+  );
+  trim = cf[22] * at * bm;
   fc_hz = cf[21];
   invr = cf[8];
 
@@ -1148,11 +1295,15 @@ loop(n_run,
   p_bp = b_k * p_v1;
   p_v3 = b_k * p_v2;
   p_a2 = p_bp * p_bp + p_v3 * p_v3;
-  p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
-  p_ep = stA[4];
-  p_amp > p_ep ? (p_ep += att_c * (p_amp - p_ep);) : (p_ep += rel_c * (p_amp - p_ep););
-  p_ep < 0.000000000001 ? p_ep = 0;
-  stA[4] = p_ep;
+  env_ph ? (
+    p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
+    p_ep = stA[4];
+    p_amp > p_ep ? (p_ep += att_2 * (p_amp - p_ep);) : (p_ep += rel_2 * (p_amp - p_ep););
+    p_ep < 0.000000000001 ? p_ep = 0;
+    stA[4] = p_ep;
+  ) : (
+    p_ep = stA[4];
+  );
   envL = p_ep;
   // Instantaneous band power for the unvoiced ratio. The synthesis envelope
   // release is up to 450 ms, which would still read "fricative" through the
@@ -1197,11 +1348,15 @@ loop(n_run,
     p_bp = b_k * p_v1;
     p_v3 = b_k * p_v2;
     p_a2 = p_bp * p_bp + p_v3 * p_v3;
-    p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
-    p_ep = stB[4];
-    p_amp > p_ep ? (p_ep += att_c * (p_amp - p_ep);) : (p_ep += rel_c * (p_amp - p_ep););
-    p_ep < 0.000000000001 ? p_ep = 0;
-    stB[4] = p_ep;
+    env_ph ? (
+      p_amp = p_a2 > 0 ? sqrt(p_a2 * 0.5) : 0;
+      p_ep = stB[4];
+      p_amp > p_ep ? (p_ep += att_2 * (p_amp - p_ep);) : (p_ep += rel_2 * (p_amp - p_ep););
+      p_ep < 0.000000000001 ? p_ep = 0;
+      stB[4] = p_ep;
+    ) : (
+      p_ep = stB[4];
+    );
     envR = p_ep;
     instR = p_a2;
     gate_off ? (
@@ -1284,25 +1439,24 @@ loop(n_run,
   stS[3] = p_v2 + p_v2 - p_ic2;
   p_bp = b_k * p_v1;
   do_enh ? (
-    p_a2 = p_bp * p_bp;
-    p_ep = stS[7];
-    p_a2 > p_ep ? (p_ep += enh_att * (p_a2 - p_ep);) : (p_ep += enh_rel * (p_a2 - p_ep););
-    p_ep < 0.000000000000000000000001 ? p_ep = 0;
-    stS[7] = p_ep;
-    p_rms = p_ep > 0 ? sqrt(p_ep) : 0;
-    p_boost = enh_boost(p_rms);
-    p_bp *= enh_mix > 0.999 ? p_boost : (1 - enh_mix + enh_mix * p_boost);
+    env_ph ? (
+      p_a2 = p_bp * p_bp;
+      p_ep = stS[7];
+      p_a2 > p_ep ? (p_ep += enh_att2 * (p_a2 - p_ep);) : (p_ep += enh_rel2 * (p_a2 - p_ep););
+      p_ep < 0.000000000000000000000001 ? p_ep = 0;
+      stS[7] = p_ep;
+      p_rms = p_ep > 0 ? sqrt(p_ep) : 0;
+      p_boost = enh_boost(p_rms);
+      stS[4] = p_boost;
+    ) : (
+      p_boost = stS[4];
+    );
+    p_bp *= enh_full ? p_boost : (enh_keep + enh_mix * p_boost);
   );
   sumL += p_bp * dgL * gLgate * trim;
 
-  ch_mono ? 0 : car_same ? (
+  ch_mono ? 0 : want_link ? (
     sumR += p_bp * dgR * gRgate * trim;
-    stT = stS + LANE_STEP;
-    stT[0] = stS[0];
-    stT[1] = stS[1];
-    stT[2] = stS[2];
-    stT[3] = stS[3];
-    stT[7] = stS[7];
   ) : (
     stT = stS + LANE_STEP;
     p_ic1 = stT[0];
@@ -1322,14 +1476,19 @@ loop(n_run,
     stT[3] = p_v2 + p_v2 - p_ic2;
     p_bp = b_k * p_v1;
     do_enh ? (
-      p_a2 = p_bp * p_bp;
-      p_ep = stT[7];
-      p_a2 > p_ep ? (p_ep += enh_att * (p_a2 - p_ep);) : (p_ep += enh_rel * (p_a2 - p_ep););
-      p_ep < 0.000000000000000000000001 ? p_ep = 0;
-      stT[7] = p_ep;
-      p_rms = p_ep > 0 ? sqrt(p_ep) : 0;
-      p_boost = enh_boost(p_rms);
-      p_bp *= enh_mix > 0.999 ? p_boost : (1 - enh_mix + enh_mix * p_boost);
+      env_ph ? (
+        p_a2 = p_bp * p_bp;
+        p_ep = stT[7];
+        p_a2 > p_ep ? (p_ep += enh_att2 * (p_a2 - p_ep);) : (p_ep += enh_rel2 * (p_a2 - p_ep););
+        p_ep < 0.000000000000000000000001 ? p_ep = 0;
+        stT[7] = p_ep;
+        p_rms = p_ep > 0 ? sqrt(p_ep) : 0;
+        p_boost = enh_boost(p_rms);
+        stT[4] = p_boost;
+      ) : (
+        p_boost = stT[4];
+      );
+      p_bp *= enh_full ? p_boost : (enh_keep + enh_mix * p_boost);
     );
     sumR += p_bp * dgR * gRgate * trim;
   );
@@ -1404,11 +1563,14 @@ active_ch == 0 ? (
   dryR = inR;
 );
 
-mix = wet * dev * duck;
+// dev crossfades the whole processed mix with bypass. duck only scales the
+// vocoder sum, so a route change goes quiet instead of falling back to dry.
+sumL *= duck;
+sumR *= duck;
 procL = (dryL * (1 - wet) + sumL * wet) * lvl;
 procR = (dryR * (1 - wet) + sumR * wet) * lvl;
-spl0 = procL * dev * duck + dryL * (1 - dev * duck);
-spl1 = procR * dev * duck + dryR * (1 - dev * duck);
+spl0 = procL * dev + dryL * (1 - dev);
+spl1 = procR * dev + dryR * (1 - dev);
 
 spl0 != spl0 ? spl0 = 0;
 spl1 != spl1 ? spl1 = 0;
@@ -1446,6 +1608,18 @@ active_carrier == 3 ? (
       yin_run();
     );
   );
+);
+
+quiet_in && abs(spl0) < 0.0000001 && abs(spl1) < 0.0000001 ? (
+  sil_hold += 1;
+  sil_hold > sil_need ? (
+    asleep = 1;
+    ring_fill = 0;
+    hop_count = 0;
+  );
+) : (
+  sil_hold = 0;
+);
 );
 
 @serialize
@@ -1564,11 +1738,13 @@ function gui_push(idx, val) (
   slider(idx) = val;
   gui_commit(idx);
   gui_moved = 1;
+  param_dirty = 1;
 );
 function gui_set(idx, val) (
   slider(idx) = val;
   gui_commit(idx);
   gui_end(idx);
+  param_dirty = 1;
 );
 function gui_drag_lin(idx, lo, hi, step) local(dy, old, nv) (
   dy = gui_prev_y - mouse_y;
@@ -1766,22 +1942,35 @@ function gui_menu_geom() local(n, ih, y, h) (
   gui_mih = ih;
   gui_mn = n;
 );
+function gui_menu_pick(j) (
+  j < 0 ? j = 0;
+  j >= gui_mn ? j = gui_mn - 1;
+  gui_menu == 1 ? gui_set(1, j) : gui_menu == 2 ? gui_set(2, j) : gui_set(21, j);
+  gui_menu = 0;
+  gui_arm = 0;
+  gui_hit_id = 0;
+);
 function gui_menu_input() local(j, hit) (
   gui_menu <= 0 ? 0 : (
     gui_blocked = 1;
     gui_menu_geom();
-    !gui_lmb ? gui_arm = 1;
-    gui_arm && gui_click ? (
-      hit = gui_in(gui_mx, gui_my, gui_mw, gui_mn * gui_mih);
-      hit ? (
-        j = floor((mouse_y - gui_my) / gui_mih);
-        j < 0 ? j = 0;
-        j >= gui_mn ? j = gui_mn - 1;
-        gui_menu == 1 ? gui_set(1, j) : gui_menu == 2 ? gui_set(2, j) : gui_set(21, j);
+    hit = gui_in(gui_mx, gui_my, gui_mw, gui_mn * gui_mih);
+    // Drag from the closed control onto an item and release.
+    // Armed clicks are the other gesture: open, release, then click.
+    gui_arm == 0 && gui_up && hit ? (
+      j = floor((mouse_y - gui_my) / gui_mih);
+      gui_menu_pick(j);
+    ) : (
+      !gui_lmb ? gui_arm = 1;
+      gui_arm && gui_click ? (
+        hit ? (
+          j = floor((mouse_y - gui_my) / gui_mih);
+          gui_menu_pick(j);
+        ) : (
+          gui_menu = 0;
+          gui_arm = 0;
+        );
       );
-      gui_menu = 0;
-      gui_arm = 0;
-      gui_hit_id = 0;
     );
   );
 );
