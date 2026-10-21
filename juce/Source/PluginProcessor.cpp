@@ -12,11 +12,15 @@ juce::NormalisableRange<float> logRange(float lo, float hi)
     return range;
 }
 
-float rawOf(const juce::AudioProcessorValueTreeState& tree, const char* id)
+inline float loadPtr(const std::atomic<float>* p) noexcept
 {
-    if (auto* v = tree.getRawParameterValue(id))
-        return v->load();
-    return 0.f;
+    return p != nullptr ? p->load(std::memory_order_relaxed) : 0.f;
+}
+
+inline float loadFinite(const std::atomic<float>* p, float fallback) noexcept
+{
+    const float v = loadPtr(p);
+    return vocIsFinite(v) ? v : fallback;
 }
 } // namespace
 
@@ -29,9 +33,35 @@ AbletonVocoderProcessor::AbletonVocoderProcessor()
 {
     for (int i = 0; i < kVocMaxBands; ++i)
     {
-        bandAttDb[i].store(0.f);
-        dispEnv[i].store(0.f);
+        bandAttDb[i].store(0.f, std::memory_order_relaxed);
+        dispEnv[i].store(0.f, std::memory_order_relaxed);
     }
+
+    paramPtrs.carrier      = apvts.getRawParameterValue(voc::carrier);
+    paramPtrs.bands        = apvts.getRawParameterValue(voc::bands);
+    paramPtrs.rangeLow     = apvts.getRawParameterValue(voc::rangeLow);
+    paramPtrs.rangeHigh    = apvts.getRawParameterValue(voc::rangeHigh);
+    paramPtrs.bw           = apvts.getRawParameterValue(voc::bw);
+    paramPtrs.filterMode   = apvts.getRawParameterValue(voc::filterMode);
+    paramPtrs.gate         = apvts.getRawParameterValue(voc::gate);
+    paramPtrs.level        = apvts.getRawParameterValue(voc::level);
+    paramPtrs.depth        = apvts.getRawParameterValue(voc::depth);
+    paramPtrs.attack       = apvts.getRawParameterValue(voc::attack);
+    paramPtrs.release      = apvts.getRawParameterValue(voc::release);
+    paramPtrs.formant      = apvts.getRawParameterValue(voc::formant);
+    paramPtrs.dryWet       = apvts.getRawParameterValue(voc::dryWet);
+    paramPtrs.channels     = apvts.getRawParameterValue(voc::channels);
+    paramPtrs.enhance      = apvts.getRawParameterValue(voc::enhance);
+    paramPtrs.unvoiced     = apvts.getRawParameterValue(voc::unvoiced);
+    paramPtrs.sens         = apvts.getRawParameterValue(voc::sens);
+    paramPtrs.uvSpeed      = apvts.getRawParameterValue(voc::uvSpeed);
+    paramPtrs.noiseRate    = apvts.getRawParameterValue(voc::noiseRate);
+    paramPtrs.noiseCrackle = apvts.getRawParameterValue(voc::noiseCrackle);
+    paramPtrs.oscWave      = apvts.getRawParameterValue(voc::oscWave);
+    paramPtrs.oscPitch     = apvts.getRawParameterValue(voc::oscPitch);
+    paramPtrs.trackLow     = apvts.getRawParameterValue(voc::trackLow);
+    paramPtrs.trackHigh    = apvts.getRawParameterValue(voc::trackHigh);
+    paramPtrs.deviceOn     = apvts.getRawParameterValue(voc::deviceOn);
 }
 
 AbletonVocoderProcessor::~AbletonVocoderProcessor() = default;
@@ -105,49 +135,58 @@ void AbletonVocoderProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
 
 void AbletonVocoderProcessor::releaseResources() {}
 
+void AbletonVocoderProcessor::reset()
+{
+    engine.reset();
+    for (int i = 0; i < kVocMaxBands; ++i)
+        dispEnv[i].store(0.f, std::memory_order_relaxed);
+}
+
 bool AbletonVocoderProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
-    if (layouts.getMainInputChannelSet() != juce::AudioChannelSet::stereo())
+    const auto mainIn = layouts.getMainInputChannelSet();
+    const auto mainOut = layouts.getMainOutputChannelSet();
+    if (mainIn != juce::AudioChannelSet::stereo() && mainIn != juce::AudioChannelSet::mono())
         return false;
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+    if (mainOut != juce::AudioChannelSet::stereo() && mainOut != juce::AudioChannelSet::mono())
         return false;
     if (layouts.inputBuses.size() > 1)
     {
         const auto side = layouts.getChannelSet(true, 1);
-        if (!side.isDisabled() && side != juce::AudioChannelSet::stereo())
+        if (!side.isDisabled() && side != juce::AudioChannelSet::stereo() && side != juce::AudioChannelSet::mono())
             return false;
     }
     return true;
 }
 
-VocoderParams AbletonVocoderProcessor::readParams() const
+VocoderParams AbletonVocoderProcessor::readParams() const noexcept
 {
     VocoderParams p;
-    p.carrier = (int) std::lround(rawOf(apvts, voc::carrier));
-    p.bands = ((int) std::lround(rawOf(apvts, voc::bands)) + 1) * 4;
-    p.rangeLow = rawOf(apvts, voc::rangeLow);
-    p.rangeHigh = rawOf(apvts, voc::rangeHigh);
-    p.bw = rawOf(apvts, voc::bw);
-    p.filterMode = (int) std::lround(rawOf(apvts, voc::filterMode));
-    p.gateDb = rawOf(apvts, voc::gate);
-    p.levelDb = rawOf(apvts, voc::level);
-    p.depth = rawOf(apvts, voc::depth);
-    p.attackMs = rawOf(apvts, voc::attack);
-    p.releaseMs = rawOf(apvts, voc::release);
-    p.formantSt = rawOf(apvts, voc::formant);
-    p.dryWet = rawOf(apvts, voc::dryWet);
-    p.channels = (int) std::lround(rawOf(apvts, voc::channels));
-    p.enhance = rawOf(apvts, voc::enhance) > 0.5f;
-    p.unvoicedDb = rawOf(apvts, voc::unvoiced);
-    p.sens = rawOf(apvts, voc::sens);
-    p.uvSpeed = (int) std::lround(rawOf(apvts, voc::uvSpeed));
-    p.noiseRate = rawOf(apvts, voc::noiseRate);
-    p.noiseCrackle = rawOf(apvts, voc::noiseCrackle);
-    p.oscWave = (int) std::lround(rawOf(apvts, voc::oscWave));
-    p.oscPitch = (int) std::lround(rawOf(apvts, voc::oscPitch));
-    p.trackLow = rawOf(apvts, voc::trackLow);
-    p.trackHigh = rawOf(apvts, voc::trackHigh);
-    p.deviceOn = rawOf(apvts, voc::deviceOn) > 0.5f;
+    p.carrier      = (int) std::lround(loadFinite(paramPtrs.carrier, 0.f));
+    p.bands        = ((int) std::lround(loadFinite(paramPtrs.bands, 4.f)) + 1) * 4;
+    p.rangeLow     = loadFinite(paramPtrs.rangeLow, 80.f);
+    p.rangeHigh    = loadFinite(paramPtrs.rangeHigh, 18000.f);
+    p.bw           = loadFinite(paramPtrs.bw, 100.f);
+    p.filterMode   = (int) std::lround(loadFinite(paramPtrs.filterMode, 0.f));
+    p.gateDb       = loadFinite(paramPtrs.gate, -96.f);
+    p.levelDb      = loadFinite(paramPtrs.level, 0.f);
+    p.depth        = loadFinite(paramPtrs.depth, 100.f);
+    p.attackMs     = loadFinite(paramPtrs.attack, 5.f);
+    p.releaseMs    = loadFinite(paramPtrs.release, 80.f);
+    p.formantSt    = loadFinite(paramPtrs.formant, 0.f);
+    p.dryWet       = loadFinite(paramPtrs.dryWet, 100.f);
+    p.channels     = (int) std::lround(loadFinite(paramPtrs.channels, 1.f));
+    p.enhance      = loadFinite(paramPtrs.enhance, 0.f) > 0.5f;
+    p.unvoicedDb   = loadFinite(paramPtrs.unvoiced, -96.f);
+    p.sens         = loadFinite(paramPtrs.sens, 50.f);
+    p.uvSpeed      = (int) std::lround(loadFinite(paramPtrs.uvSpeed, 0.f));
+    p.noiseRate    = loadFinite(paramPtrs.noiseRate, 1.f);
+    p.noiseCrackle = loadFinite(paramPtrs.noiseCrackle, 1.f);
+    p.oscWave      = (int) std::lround(loadFinite(paramPtrs.oscWave, 0.f));
+    p.oscPitch     = (int) std::lround(loadFinite(paramPtrs.oscPitch, 0.f));
+    p.trackLow     = loadFinite(paramPtrs.trackLow, 60.f);
+    p.trackHigh    = loadFinite(paramPtrs.trackHigh, 1000.f);
+    p.deviceOn     = loadFinite(paramPtrs.deviceOn, 1.f) > 0.5f;
     return p;
 }
 
@@ -156,23 +195,64 @@ void AbletonVocoderProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     juce::ScopedNoDenormals noDenormals;
     const int n = buffer.getNumSamples();
     const int ch = buffer.getNumChannels();
-    if (n <= 0 || ch < 2)
+    if (n <= 0 || ch < 1)
         return;
 
-    auto* side = getBus(true, 1);
-    const bool sideOn = side != nullptr && side->isEnabled() && ch >= 4;
-    const float* extL = sideOn ? buffer.getReadPointer(2) : nullptr;
-    const float* extR = sideOn ? buffer.getReadPointer(3) : nullptr;
+    auto mainIn = getBusBuffer(buffer, true, 0);
+    auto mainOut = getBusBuffer(buffer, false, 0);
+    const int inCh = mainIn.getNumChannels();
+    const int outCh = mainOut.getNumChannels();
+    if (inCh < 1 || outCh < 1)
+        return;
+
+    const float* modL = mainIn.getReadPointer(0);
+    const float* modR = inCh >= 2 ? mainIn.getReadPointer(1) : modL;
+
+    const float* extL = nullptr;
+    const float* extR = nullptr;
+    if (auto* sideBus = getBus(true, 1); sideBus != nullptr && sideBus->isEnabled() && getBusCount(true) > 1)
+    {
+        auto sideBuf = getBusBuffer(buffer, true, 1);
+        if (sideBuf.getNumChannels() >= 1)
+        {
+            extL = sideBuf.getReadPointer(0);
+            extR = sideBuf.getNumChannels() >= 2 ? sideBuf.getReadPointer(1) : extL;
+        }
+    }
 
     float att[kVocMaxBands];
     float disp[kVocMaxBands];
     for (int i = 0; i < kVocMaxBands; ++i)
         att[i] = bandAttDb[i].load(std::memory_order_relaxed);
 
-    engine.process(buffer.getReadPointer(0), buffer.getReadPointer(1),
-                   extL, extR,
-                   buffer.getWritePointer(0), buffer.getWritePointer(1),
-                   n, readParams(), att, disp);
+    const VocoderParams p = readParams();
+    float* outPtrL = mainOut.getWritePointer(0);
+    float* outPtrR = outCh >= 2 ? mainOut.getWritePointer(1) : nullptr;
+    const bool sideAliasesOutR = (outPtrR != nullptr && (outPtrR == extL || outPtrR == extR));
+
+    if (outPtrR != nullptr && !sideAliasesOutR)
+    {
+        engine.process(modL, modR, extL, extR, outPtrL, outPtrR, n, p, att, disp);
+    }
+    else
+    {
+        float scratchL[kVocSub];
+        float scratchR[kVocSub];
+        int offset = 0;
+        while (offset < n)
+        {
+            const int m = std::min(kVocSub, n - offset);
+            engine.process(modL + offset, modR + offset,
+                           extL != nullptr ? extL + offset : nullptr,
+                           extR != nullptr ? extR + offset : nullptr,
+                           scratchL, scratchR,
+                           m, p, att, disp);
+            std::memcpy(outPtrL + offset, scratchL, sizeof(float) * (size_t) m);
+            if (outPtrR != nullptr)
+                std::memcpy(outPtrR + offset, scratchR, sizeof(float) * (size_t) m);
+            offset += m;
+        }
+    }
 
     for (int i = 0; i < kVocMaxBands; ++i)
         dispEnv[i].store(disp[i], std::memory_order_relaxed);
@@ -187,7 +267,10 @@ void AbletonVocoderProcessor::setBandAttDb(int index, float db)
 {
     if (index < 0 || index >= kVocMaxBands)
         return;
+    if (!vocIsFinite(db))
+        db = 0.f;
     bandAttDb[index].store(juce::jlimit(-60.f, 0.f, db), std::memory_order_relaxed);
+    stateRevision.fetch_add(1, std::memory_order_relaxed);
 }
 
 float AbletonVocoderProcessor::getBandAttDb(int index) const
@@ -201,6 +284,7 @@ void AbletonVocoderProcessor::resetAllBands()
 {
     for (int i = 0; i < kVocMaxBands; ++i)
         bandAttDb[i].store(0.f, std::memory_order_relaxed);
+    stateRevision.fetch_add(1, std::memory_order_relaxed);
 }
 
 void AbletonVocoderProcessor::getStateInformation(juce::MemoryBlock& destData)
@@ -208,28 +292,39 @@ void AbletonVocoderProcessor::getStateInformation(juce::MemoryBlock& destData)
     juce::ValueTree state = apvts.copyState();
     auto bandsNode = state.getOrCreateChildWithName("bands", nullptr);
     for (int i = 0; i < kVocMaxBands; ++i)
-        bandsNode.setProperty("a" + juce::String(i), bandAttDb[i].load(), nullptr);
+        bandsNode.setProperty("a" + juce::String(i), bandAttDb[i].load(std::memory_order_relaxed), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary(*xml, destData);
 }
 
 void AbletonVocoderProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    if (auto xml = getXmlFromBinary(data, sizeInBytes))
+    auto xml = getXmlFromBinary(data, sizeInBytes);
+    if (xml == nullptr || !xml->hasTagName(apvts.state.getType().toString()))
+        return;
+    const auto tree = juce::ValueTree::fromXml(*xml);
+    if (!tree.isValid())
+        return;
+    apvts.replaceState(tree);
+    for (auto* param : getParameters())
     {
-        const auto tree = juce::ValueTree::fromXml(*xml);
-        if (!tree.isValid())
-            return;
-        apvts.replaceState(tree);
-        auto bandsNode = tree.getChildWithName("bands");
-        for (int i = 0; i < kVocMaxBands; ++i)
-        {
-            const float db = bandsNode.isValid()
-                ? (float) bandsNode.getProperty("a" + juce::String(i), 0.0f)
-                : 0.f;
-            bandAttDb[i].store(juce::jlimit(-60.f, 0.f, db));
-        }
+        if (param == nullptr)
+            continue;
+        const float norm = param->getValue();
+        if (!vocIsFinite(norm))
+            param->setValue(param->getDefaultValue());
     }
+    auto bandsNode = tree.getChildWithName("bands");
+    for (int i = 0; i < kVocMaxBands; ++i)
+    {
+        float db = 0.f;
+        if (bandsNode.isValid())
+            db = (float) bandsNode.getProperty("a" + juce::String(i), 0.0f);
+        if (!vocIsFinite(db))
+            db = 0.f;
+        bandAttDb[i].store(juce::jlimit(-60.f, 0.f, db), std::memory_order_relaxed);
+    }
+    stateRevision.fetch_add(1, std::memory_order_relaxed);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <vector>
 
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
@@ -58,6 +57,26 @@ float onePole(double timeSec, double sr)
     return (float) (1.0 - std::exp(-1.0 / (timeSec * sr)));
 }
 
+// Non-finite input falls back. Finite values use std::clamp, including values
+// outside [lo, hi]. The finite test is a bitmask so -ffast-math cannot turn
+// NaN into a "successful" comparison that poisons the smoother forever.
+float safeClamp(float x, float lo, float hi, float fallback) noexcept
+{
+    if (!vocIsFinite(x))
+    {
+        if (!vocIsFinite(fallback))
+            return std::clamp(0.f, lo, hi);
+        return std::clamp(fallback, lo, hi);
+    }
+    return std::clamp(x, lo, hi);
+}
+
+void healScalar(float& x, float fallback) noexcept
+{
+    if (!vocIsFinite(x))
+        x = vocIsFinite(fallback) ? fallback : 0.f;
+}
+
 #if defined(__aarch64__)
 struct NoDenorms
 {
@@ -75,28 +94,43 @@ struct NoDenorms
         asm volatile("msr fpcr, %0" :: "r"(old));
     }
 };
+#elif VOC_SSE2
+struct NoDenorms
+{
+    unsigned int old;
+    NoDenorms() noexcept : old(_mm_getcsr())
+    {
+        _mm_setcsr(old | 0x8040u); // FTZ + DAZ
+    }
+    ~NoDenorms() noexcept
+    {
+        _mm_setcsr(old);
+    }
+};
 #else
 struct NoDenorms
 {
-    NoDenorms() noexcept = default;
+    NoDenorms() noexcept {}
+    ~NoDenorms() noexcept {}
 };
 #endif
 
 VOC_INLINE V4 svf2(V4 x, V4 a1, V4 a2, V4 a3, V4 k,
                    V4& ic1, V4& ic2, V4& jc1, V4& jc2, V4& power) noexcept
 {
+    const V4 two = V4::splat(2.f);
     V4 v3 = x - ic2;
     V4 v1 = a1 * ic1 + a2 * v3;
     V4 v2 = ic2 + a2 * ic1 + a3 * v3;
-    ic1 = v1 + v1 - ic1;
-    ic2 = v2 + v2 - ic2;
+    ic1 = two * v1 - ic1;
+    ic2 = two * v2 - ic2;
     V4 bp = k * v1;
 
     v3 = bp - jc2;
     v1 = a1 * jc1 + a2 * v3;
     v2 = jc2 + a2 * jc1 + a3 * v3;
-    jc1 = v1 + v1 - jc1;
-    jc2 = v2 + v2 - jc2;
+    jc1 = two * v1 - jc1;
+    jc2 = two * v2 - jc2;
     bp = k * v1;
     const V4 lp = k * v2;
     power = bp * bp + lp * lp;
@@ -165,6 +199,7 @@ float polyblep(float t, float dt) noexcept
 void VocoderEngine::prepare(double sampleRate, int)
 {
     sr = sampleRate > 1000.0 ? sampleRate : 48000.0;
+    silenceNeed = std::max(64, (int) std::floor(0.05 * sr));
     decim = 1;
     while (sr / (double) (decim + 1) >= 7500.0)
         ++decim;
@@ -179,20 +214,47 @@ void VocoderEngine::prepare(double sampleRate, int)
     const double g = std::exp(-50.0 * kDb2A);
     yinGate2 = (float) (g * g);
     key = {};
+    hasCachedParams = false;
+    cachedSr = -1.0;
     reset();
+
+    // Pre-build initial default filterbank so first audio block does less work
+    designTargets();
+    smoothCoeffs(kVocSub, true);
 }
 
 void VocoderEngine::reset()
 {
     boot = true;
+    coefSettling = true;
+    asleep = false;
+    devCleared = false;
+    silenceHold = 0;
+    const V4 z = V4::splat(0.f);
+    const V4 one = V4::splat(1.f);
+    for (int i = 0; i < kVocMaxBands; ++i)
+    {
+        bands[(size_t) i].initialized = false;
+        bands[(size_t) i].sign = (i & 1) ? -1.0 : 1.0;
+    }
+
     for (auto& Q : quads)
     {
-        std::memset(&Q, 0, sizeof(Q));
-        const V4 one = V4::splat(1.f);
+        Q = Quad {};
+        Q.al1 = Q.al2 = Q.al3 = Q.al4 = z;
+        Q.ar1 = Q.ar2 = Q.ar3 = Q.ar4 = z;
+        Q.sl1 = Q.sl2 = Q.sl3 = Q.sl4 = z;
+        Q.sr1 = Q.sr2 = Q.sr3 = Q.sr4 = z;
+        Q.envL = Q.envR = z;
+        Q.enhL = Q.enhR = z;
         Q.gateL = Q.gateR = Q.openL = Q.openR = one;
+        Q.att = Q.attTarget = one;
     }
     formantSm = 0.f;
     formantApplied = 1.0e9f;
+    depthSm = depthTarget = 100.f;
+    depthMode = 1;
+    depthK = 1.f;
     lvl = wet = dev = duck = 1.f;
     enhMix = 0.f;
     enhPeak = 0.f;
@@ -209,6 +271,12 @@ void VocoderEngine::reset()
     decA1 = decA2 = decB1 = decB2 = 0.f;
     decI = hopCount = ringW = ringFill = 0;
     ring.fill(0.f);
+    designHoldSamples = 0;
+    designPending = false;
+    prevActiveBands = -1;
+    key = {};
+    hasCachedParams = false;
+    cachedSr = -1.0;
 }
 
 void VocoderEngine::clearSynthIC()
@@ -222,11 +290,136 @@ void VocoderEngine::clearSynthIC()
     }
 }
 
-void VocoderEngine::clearAnalysisIC()
+void VocoderEngine::clearAnalysisIC(bool clearEnvelopes)
 {
     const V4 z = V4::splat(0.f);
+    const V4 one = V4::splat(1.f);
     for (auto& Q : quads)
-        Q.al1 = Q.al2 = Q.al3 = Q.al4 = Q.ar1 = Q.ar2 = Q.ar3 = Q.ar4 = z;
+    {
+        Q.al1 = Q.al2 = Q.al3 = Q.al4 = z;
+        Q.ar1 = Q.ar2 = Q.ar3 = Q.ar4 = z;
+        if (clearEnvelopes)
+        {
+            Q.envL = Q.envR = z;
+            Q.gateL = Q.gateR = Q.openL = Q.openR = one;
+        }
+    }
+}
+
+void VocoderEngine::sanitizeFilterStates()
+{
+    healScalar(lvl, lvlTarget);
+    healScalar(wet, wetTarget);
+    healScalar(dev, devTarget);
+    healScalar(enhMix, enhTarget);
+    healScalar(depthSm, depthTarget);
+    healScalar(depthBlend, 1.f);
+    healScalar(formantSm, formantTarget);
+    healScalar(duck, duckTarget);
+    healScalar(uvEnv, 0.f);
+    if (!vocIsFinite(enhPeak))
+        enhPeak = 0.f;
+    if (!vocIsFinite(decA1) || !vocIsFinite(decA2) || !vocIsFinite(decB1) || !vocIsFinite(decB2))
+        decA1 = decA2 = decB1 = decB2 = 0.f;
+    healScalar(ptLog, ptTargetLog);
+    if (!vocIsFinite(oscPhase) || oscPhase < 0.f || oscPhase >= 1.f)
+        oscPhase = 0.f;
+
+    bool ok = true;
+    for (int q = 0; q < kVocQuads; ++q)
+    {
+        const Quad& Q = quads[(size_t) q];
+        if (!Q.al1.allFinite() || !Q.al2.allFinite() || !Q.al3.allFinite() || !Q.al4.allFinite()
+            || !Q.ar1.allFinite() || !Q.ar2.allFinite() || !Q.ar3.allFinite() || !Q.ar4.allFinite()
+            || !Q.sl1.allFinite() || !Q.sl2.allFinite() || !Q.sl3.allFinite() || !Q.sl4.allFinite()
+            || !Q.sr1.allFinite() || !Q.sr2.allFinite() || !Q.sr3.allFinite() || !Q.sr4.allFinite()
+            || !Q.envL.allFinite() || !Q.envR.allFinite() || !Q.enhL.allFinite() || !Q.enhR.allFinite())
+        {
+            ok = false;
+            break;
+        }
+    }
+    if (!ok || !(enhPeak >= 0.f && enhPeak < 1.0e12f) || !(uvEnv >= 0.f && uvEnv <= 2.f))
+    {
+        clearAnalysisIC(true);
+        clearSynthIC();
+        enhPeak = 0.f;
+        uvEnv = 0.f;
+    }
+}
+
+void VocoderEngine::clearBandLane(int band) noexcept
+{
+    Quad& Q = quads[(size_t) (band >> 2)];
+    const int lane = band & 3;
+    auto setLane = [lane](V4& v, float value) {
+        alignas(16) float t[4];
+        v.store(t);
+        t[lane] = value;
+        v = V4::load(t);
+    };
+    setLane(Q.al1, 0.f);
+    setLane(Q.al2, 0.f);
+    setLane(Q.al3, 0.f);
+    setLane(Q.al4, 0.f);
+    setLane(Q.ar1, 0.f);
+    setLane(Q.ar2, 0.f);
+    setLane(Q.ar3, 0.f);
+    setLane(Q.ar4, 0.f);
+    setLane(Q.sl1, 0.f);
+    setLane(Q.sl2, 0.f);
+    setLane(Q.sl3, 0.f);
+    setLane(Q.sl4, 0.f);
+    setLane(Q.sr1, 0.f);
+    setLane(Q.sr2, 0.f);
+    setLane(Q.sr3, 0.f);
+    setLane(Q.sr4, 0.f);
+    setLane(Q.envL, 0.f);
+    setLane(Q.envR, 0.f);
+    setLane(Q.enhL, 0.f);
+    setLane(Q.enhR, 0.f);
+    setLane(Q.gateL, 1.f);
+    setLane(Q.gateR, 1.f);
+    setLane(Q.openL, 1.f);
+    setLane(Q.openR, 1.f);
+}
+
+void VocoderEngine::retireInactiveBands() noexcept
+{
+    // Bands that have faded out (or were dropped before the 12 ms mix tail
+    // reached zero) are no longer visited by analyze/synth. Their envelopes
+    // and SVF integrators would otherwise stay frozen and blast on the next
+    // Bands increase. A lane that is switching back on from that silence
+    // starts at zero so the attack rebuilds it.
+    const int prev = prevActiveBands;
+    for (int i = 0; i < kVocMaxBands; ++i)
+    {
+        Quad& Q = quads[(size_t) (i >> 2)];
+        const int lane = i & 3;
+        alignas(16) float mix[4];
+        Q.mix.store(mix);
+        const float m = mix[lane];
+        const bool active = i < nBands;
+        const bool reactivated = active && prev >= 0 && i >= prev && m <= 0.001f;
+        const bool faded = !active && m <= 0.001f;
+        if (!reactivated && !faded)
+            continue;
+        if (faded && m == 0.f)
+        {
+            alignas(16) float env[4], ic[4], envR[4], icR[4];
+            Q.envL.store(env);
+            Q.envR.store(envR);
+            Q.al1.store(ic);
+            Q.sl1.store(icR);
+            if (env[lane] == 0.f && envR[lane] == 0.f && ic[lane] == 0.f && icR[lane] == 0.f)
+                continue;
+        }
+        clearBandLane(i);
+        Q.mix.store(mix);
+        mix[lane] = 0.f;
+        Q.mix = V4::load(mix);
+    }
+    prevActiveBands = nBands;
 }
 
 void VocoderEngine::resetPitchRing()
@@ -285,33 +478,57 @@ void VocoderEngine::designTargets()
 
     auto bandVr = [&](double fc, double qq) {
         const double g = std::tan(kPi * std::min(fc, sr * 0.45) / sr);
-        double vr = g / (2.0 * qq * (1.0 + g * g));
-        if (qq >= 1.2 && fc < sr * 0.12)
-            return std::max(vr, 1.0e-10);
-        constexpr int n = 72;
-        const double f1 = std::max(fc / 32.0, 1.0);
-        const double f2 = std::min(fc * 32.0, sr * 0.49);
-        if (f2 <= f1)
-            return std::max(vr, 1.0e-10);
-        const double step = std::log(f2 / f1) / (double) (n - 1);
-        double prevF = f1;
-        double prevP = h4(f1, fc, qq);
-        vr = 0.0;
-        for (int i = 1; i < n; ++i)
+        const double analytic = g / (2.0 * qq * (1.0 + g * g));
+        const double ratio = fc / sr;
+        // Below 0.08*sr the closed form matches the old early-out (which used
+        // 0.12*sr). High bands, and the crossfade up to 0.14*sr, integrate on
+        // a grid that always lands on fc so a narrow high-Q peak cannot fall
+        // between 0.14-octave steps.
+        if (qq >= 1.2 && ratio <= 0.08)
+            return std::max(analytic, 1.0e-10);
+
+        int n = (int) std::ceil(72.0 * std::max(1.0, qq / 4.0));
+        n = std::clamp(n, 144, 1024);
+        if (n & 1)
+            n = n < 1024 ? n + 1 : n - 1;
+        const double fMin = std::max(fc / 32.0, 1.0);
+        const double fMax = std::min(fc * 32.0, sr * 0.49);
+        double numeric = analytic;
+        if (fMax > fMin)
         {
-            const double f = f1 * std::exp(step * i);
-            const double p = h4(f, fc, qq);
-            vr += (prevP + p) * 0.5 * (f - prevF);
-            prevF = f;
-            prevP = p;
+            const double fcSplit = std::clamp(fc, fMin, fMax);
+            const int half = std::max(1, n / 2);
+            auto trap = [&](double fa, double fb, int steps) {
+                if (steps < 1 || !(fb > fa))
+                    return 0.0;
+                const double logStep = std::log(fb / fa) / (double) steps;
+                double prevF = fa;
+                double prevP = h4(fa, fc, qq);
+                double acc = 0.0;
+                for (int i = 1; i <= steps; ++i)
+                {
+                    const double f = fa * std::exp(logStep * (double) i);
+                    const double p = h4(f, fc, qq);
+                    acc += (prevP + p) * 0.5 * (f - prevF);
+                    prevF = f;
+                    prevP = p;
+                }
+                return acc;
+            };
+            numeric = 2.0 * (trap(fMin, fcSplit, half) + trap(fcSplit, fMax, half)) / sr;
         }
-        vr = 2.0 * vr / sr;
-        return std::max(vr, 1.0e-10);
+        double t = (ratio - 0.08) / (0.14 - 0.08);
+        t = std::clamp(t, 0.0, 1.0);
+        t = t * t * (3.0 - 2.0 * t);
+        if (qq < 1.2 || ratio >= 0.14)
+            t = 1.0;
+        return std::max(analytic * (1.0 - t) + numeric * t, 1.0e-10);
     };
 
     for (int i = 0; i < kVocMaxBands; ++i)
     {
         Band& b = bands[(size_t) i];
+        b.sign = (i & 1) ? -1.0 : 1.0;
         if (i < nBands)
         {
             const double t = nBands > 1 ? (double) i / (double) (nBands - 1) : 0.0;
@@ -330,24 +547,34 @@ void VocoderEngine::designTargets()
             }
             b.logFcT = std::log(fc);
             b.qT = qq;
-            b.sign = (i & 1) ? -1.0 : 1.0;
-            const double vr = bandVr(fc, qq);
-            b.invSqrtVr = 1.0 / std::sqrt(vr);
+            // Reference the noise-gain law to 48 kHz. At 48000 this multiply
+            // is exactly 1, so the calibrated trims stay bit-identical.
+            const double vr = std::max(bandVr(fc, qq) * (sr / 48000.0), 1.0e-10);
+            b.invSqrtVrT = 1.0 / std::sqrt(vr);
             b.fc = fc;
+            if (!b.initialized)
+            {
+                b.logFc = b.logFcT;
+                b.q = b.qT;
+                b.retro = b.retroT;
+                b.invSqrtVr = b.invSqrtVrT;
+            }
         }
-        else
+        else if (!b.initialized)
         {
-            b.logFcT = std::log(std::max(lo, 20.0));
-            b.qT = 1.0;
-            b.retroT = 1.0;
-            b.flatT = 0.0;
-            b.invSqrtVr = 1.0;
-            b.sign = 1.0;
+            b.logFc = b.logFcT = std::log(lo);
+            b.q = b.qT = 1.0;
+            b.retro = b.retroT = 1.0;
+            b.flat = b.flatT = 0.0;
+            b.invSqrtVr = b.invSqrtVrT = 1.0;
             b.fc = lo;
         }
+        // Previously active bands (i >= nBands && b.initialized) keep their previous logFcT, qT,
+        // invSqrtVrT, flatT, retroT so that while their `mix` fades to 0 over 12 ms, they do not
+        // chirp down to `lo`, flip polarity, or jump in gain.
     }
 
-    const int nfreq = 36;
+    constexpr int nfreq = kVocDesignFreqs;
     double fmin = lo * 1.25;
     double fmax = hi * 0.8;
     if (fmax > sr * 0.45)
@@ -355,14 +582,20 @@ void VocoderEngine::designTargets()
     if (nBands < 2 || fmax <= fmin * 1.02)
     {
         for (int i = 0; i < nBands; ++i)
+        {
             bands[(size_t) i].flatT = 1.0;
+            if (!bands[(size_t) i].initialized)
+            {
+                bands[(size_t) i].flat = 1.0;
+                bands[(size_t) i].initialized = true;
+            }
+        }
+        coefSettling = true;
         return;
     }
 
-    std::vector<double> HR((size_t) nfreq * kVocMaxBands);
-    std::vector<double> HI((size_t) nfreq * kVocMaxBands);
-    std::vector<double> G((size_t) nBands, 1.0);
-    std::vector<double> SR((size_t) nfreq), SI((size_t) nfreq), mag((size_t) nfreq);
+    for (int bi = 0; bi < nBands; ++bi)
+        solveG[(size_t) bi] = 1.0;
 
     auto resp = [&](double freq, double fc, double qq, double& re, double& im) {
         double g = std::tan(kPi * std::min(fc, sr * 0.45) / sr);
@@ -393,17 +626,20 @@ void VocoderEngine::designTargets()
             double re = 0, im = 0;
             resp(freq, std::exp(b.logFcT), b.qT, re, im);
             const size_t idx = (size_t) fi * kVocMaxBands + (size_t) bi;
-            HR[idx] = re * b.sign;
-            HI[idx] = im * b.sign;
+            solveHR[idx] = re * b.sign;
+            solveHI[idx] = im * b.sign;
         }
     }
 
-    auto median = [](std::vector<double> v) {
-        if (v.size() < 2)
-            return v.empty() ? 1.0 : v[0];
-        std::sort(v.begin(), v.end());
-        const size_t n = v.size();
-        return 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    auto medianInPlace = [&]() -> double {
+        std::memcpy(solveTmp.data(), solveMag.data(), sizeof(double) * nfreq);
+        const size_t mid = nfreq / 2;
+        std::nth_element(solveTmp.begin(), solveTmp.begin() + (ptrdiff_t) mid, solveTmp.begin() + nfreq);
+        const double hiMed = solveTmp[mid];
+        double loMed = solveTmp[0];
+        for (size_t i = 1; i < mid; ++i)
+            loMed = std::max(loMed, solveTmp[i]);
+        return 0.5 * (loMed + hiMed);
     };
 
     for (int iter = 0; iter < 4; ++iter)
@@ -414,33 +650,33 @@ void VocoderEngine::designTargets()
             for (int bi = 0; bi < nBands; ++bi)
             {
                 const size_t idx = (size_t) fi * kVocMaxBands + (size_t) bi;
-                ar += HR[idx] * G[(size_t) bi];
-                ai += HI[idx] * G[(size_t) bi];
+                ar += solveHR[idx] * solveG[(size_t) bi];
+                ai += solveHI[idx] * solveG[(size_t) bi];
             }
-            SR[(size_t) fi] = ar;
-            SI[(size_t) fi] = ai;
-            mag[(size_t) fi] = std::sqrt(ar * ar + ai * ai) + 1.0e-12;
+            solveSR[(size_t) fi] = ar;
+            solveSI[(size_t) fi] = ai;
+            solveMag[(size_t) fi] = std::sqrt(ar * ar + ai * ai) + 1.0e-12;
         }
-        const double med = median(mag);
+        const double med = medianInPlace();
         for (int bi = 0; bi < nBands; ++bi)
         {
             double num = 0, den = 0;
             for (int fi = 0; fi < nfreq; ++fi)
             {
                 const size_t idx = (size_t) fi * kVocMaxBands + (size_t) bi;
-                const double xr = HR[idx];
-                const double xi = HI[idx];
-                const double m = std::sqrt(SR[(size_t) fi] * SR[(size_t) fi] + SI[(size_t) fi] * SI[(size_t) fi]) + 1.0e-12;
-                const double tr = med * SR[(size_t) fi] / m - SR[(size_t) fi] + G[(size_t) bi] * xr;
-                const double ti = med * SI[(size_t) fi] / m - SI[(size_t) fi] + G[(size_t) bi] * xi;
+                const double xr = solveHR[idx];
+                const double xi = solveHI[idx];
+                const double m = solveMag[(size_t) fi];
+                const double tr = med * solveSR[(size_t) fi] / m - solveSR[(size_t) fi] + solveG[(size_t) bi] * xr;
+                const double ti = med * solveSI[(size_t) fi] / m - solveSI[(size_t) fi] + solveG[(size_t) bi] * xi;
                 num += xr * tr + xi * ti;
                 den += xr * xr + xi * xi;
             }
             if (den < 1.0e-10)
                 den = 1.0e-10;
             double gn = num / den;
-            gn = 0.55 * G[(size_t) bi] + 0.45 * gn;
-            G[(size_t) bi] = std::clamp(gn, 0.2, 5.0);
+            gn = 0.55 * solveG[(size_t) bi] + 0.45 * gn;
+            solveG[(size_t) bi] = std::clamp(gn, 0.2, 5.0);
         }
     }
 
@@ -450,34 +686,58 @@ void VocoderEngine::designTargets()
         for (int bi = 0; bi < nBands; ++bi)
         {
             const size_t idx = (size_t) fi * kVocMaxBands + (size_t) bi;
-            ar += HR[idx] * G[(size_t) bi];
-            ai += HI[idx] * G[(size_t) bi];
+            ar += solveHR[idx] * solveG[(size_t) bi];
+            ai += solveHI[idx] * solveG[(size_t) bi];
         }
-        mag[(size_t) fi] = std::sqrt(ar * ar + ai * ai) + 1.0e-12;
+        solveMag[(size_t) fi] = std::sqrt(ar * ar + ai * ai) + 1.0e-12;
     }
-    double med = median(mag);
+    double med = medianInPlace();
     if (med < 1.0e-4)
         med = 1.0;
     for (int bi = 0; bi < nBands; ++bi)
-        bands[(size_t) bi].flatT = G[(size_t) bi] / med;
+    {
+        bands[(size_t) bi].flatT = solveG[(size_t) bi] / med;
+        if (!bands[(size_t) bi].initialized)
+        {
+            bands[(size_t) bi].flat = bands[(size_t) bi].flatT;
+            bands[(size_t) bi].initialized = true;
+        }
+    }
+
+    coefSettling = true;
 }
 
-void VocoderEngine::smoothCoeffs(int hostBlock, bool snap)
+void VocoderEngine::smoothCoeffs(int stepSamples, bool snap)
 {
-    const double a = snap ? 1.0 : std::min(1.0, 1.0 - std::exp(-(double) hostBlock / (0.02 * sr)));
+    const double a = snap ? 1.0 : std::min(1.0, 1.0 - std::exp(-(double) stepSamples / (0.02 * sr)));
     bool moved = snap;
+    bool svfMoved = snap;
+
     if (snap)
+    {
         formantSm = formantTarget;
+    }
     else
     {
-        const double fa = 1.0 - std::exp(-(double) hostBlock / (0.012 * sr));
-        const double prev = formantSm;
-        formantSm += fa * (formantTarget - formantSm);
-        if (std::abs(formantSm - prev) > 1.0e-5)
-            moved = true;
+        const double dF = (double) formantTarget - (double) formantSm;
+        if (std::abs(dF) <= 1.0e-4)
+        {
+            if (std::memcmp(&formantSm, &formantTarget, sizeof(float)) != 0)
+            {
+                formantSm = formantTarget;
+                moved = svfMoved = true;
+            }
+        }
+        else
+        {
+            const double fa = 1.0 - std::exp(-(double) stepSamples / (0.012 * sr));
+            formantSm += (float) (fa * dF);
+            moved = svfMoved = true;
+        }
     }
-    const double formRatio = std::exp(formantSm * kLn2 / 12.0);
+    const double formRatio = std::exp((double) formantSm * kLn2 / 12.0);
 
+    bool anyUnsettled = (std::memcmp(&formantSm, &formantTarget, sizeof(float)) != 0);
     for (int i = 0; i < kVocMaxBands; ++i)
     {
         Band& b = bands[(size_t) i];
@@ -487,21 +747,40 @@ void VocoderEngine::smoothCoeffs(int hostBlock, bool snap)
             b.q = b.qT;
             b.retro = b.retroT;
             b.flat = b.flatT;
+            b.invSqrtVr = b.invSqrtVrT;
         }
         else
         {
-            const double dL = b.logFcT - b.logFc;
-            const double dQ = b.qT - b.q;
-            b.logFc += a * dL;
-            b.q += a * dQ;
-            b.retro += a * (b.retroT - b.retro);
-            b.flat += a * (b.flatT - b.flat);
-            if (std::abs(a * dL) > 1.0e-6 || std::abs(a * dQ) > 1.0e-5)
-                moved = true;
+            auto stepVal = [&](double& cur, double tgt, double eps, bool isSvf) {
+                const double d = tgt - cur;
+                if (std::abs(d) <= eps)
+                {
+                    if (std::memcmp(&cur, &tgt, sizeof(double)) != 0)
+                    {
+                        cur = tgt;
+                        moved = true;
+                        if (isSvf)
+                            svfMoved = true;
+                    }
+                }
+                else
+                {
+                    cur += a * d;
+                    moved = true;
+                    anyUnsettled = true;
+                    if (isSvf)
+                        svfMoved = true;
+                }
+            };
+            stepVal(b.logFc, b.logFcT, 1.0e-5, true);
+            stepVal(b.q, b.qT, 1.0e-5, true);
+            stepVal(b.retro, b.retroT, 1.0e-5, false);
+            stepVal(b.flat, b.flatT, 1.0e-5, false);
+            stepVal(b.invSqrtVr, b.invSqrtVrT, 1.0e-4, false);
         }
     }
 
-    if (moved || std::abs(formantSm - formantApplied) > 1.0e-4)
+    if (svfMoved || std::abs(formantSm - formantApplied) > 1.0e-4f)
     {
         for (int i = 0; i < kVocMaxBands; ++i)
         {
@@ -522,8 +801,14 @@ void VocoderEngine::smoothCoeffs(int hostBlock, bool snap)
             b.fc = fc;
         }
         formantApplied = formantSm;
+        moved = true;
     }
-    packQuads();
+
+    if (moved)
+        packQuads();
+
+    retireInactiveBands();
+    coefSettling = anyUnsettled;
 }
 
 void VocoderEngine::packQuads()
@@ -532,7 +817,7 @@ void VocoderEngine::packQuads()
     {
         alignas(16) float a1[4], a2[4], a3[4], k[4];
         alignas(16) float s1[4], s2[4], s3[4], sk[4];
-        alignas(16) float inv[4], pol[4], flat[4], retro[4], hi[4];
+        alignas(16) float inv[4], pol[4], flat[4], retArr[4], hi[4];
         for (int i = 0; i < 4; ++i)
         {
             const Band& b = bands[(size_t) (q * 4 + i)];
@@ -541,7 +826,7 @@ void VocoderEngine::packQuads()
             inv[i] = (float) b.invSqrtVr;
             pol[i] = (float) b.sign;
             flat[i] = (float) b.flat;
-            retro[i] = (float) b.retro;
+            retArr[i] = (float) b.retro;
             hi[i] = b.fc >= 4000.0 ? 1.f : 0.f;
         }
         Quad& Q = quads[(size_t) q];
@@ -550,7 +835,7 @@ void VocoderEngine::packQuads()
         Q.invVr = V4::load(inv);
         Q.pol = V4::load(pol);
         Q.flat = V4::load(flat);
-        Q.retro = V4::load(retro);
+        Q.retro = V4::load(retArr);
         Q.hi = V4::load(hi);
     }
 }
@@ -568,6 +853,7 @@ void VocoderEngine::updateActiveMask()
 
 void VocoderEngine::computeRunQuads()
 {
+    retireInactiveBands();
     nRunQuads = 0;
     for (int q = 0; q < kVocQuads; ++q)
     {
@@ -591,14 +877,13 @@ void VocoderEngine::considerRoute()
     {
         pendingCarrier = wantCarrier;
         pendingCh = wantCh;
-        if (!pending)
-        {
-            pending = true;
-            duckTarget = 0.f;
-        }
+        pending = true;
+        duckTarget = 0.f;
     }
-    else if (!pending)
+    else
     {
+        // If user switched A -> B -> A before duck landed, cancel pending transition
+        pending = false;
         duckTarget = 1.f;
     }
 
@@ -611,8 +896,21 @@ void VocoderEngine::considerRoute()
         pending = false;
         duckTarget = 1.f;
         clearSynthIC();
-        if (prevCh != activeCh)
-            clearAnalysisIC();
+        // When entering L/R mode from Mono/Stereo, copy left analysis states/envelopes into right
+        // instead of leaving stale envR or zeroing al1..al4 on Mono <-> Stereo switches.
+        if (activeCh == 2 && prevCh != 2)
+        {
+            for (auto& Q : quads)
+            {
+                Q.ar1 = Q.al1;
+                Q.ar2 = Q.al2;
+                Q.ar3 = Q.al3;
+                Q.ar4 = Q.al4;
+                Q.envR = Q.envL;
+                Q.openR = Q.openL;
+                Q.gateR = Q.gateL;
+            }
+        }
         if (activeCarrier == 3 && prevCar != 3)
             resetPitchRing();
     }
@@ -820,11 +1118,11 @@ void VocoderEngine::yinRun()
 
     if (tau > 1)
     {
-        const float a = yinD[(size_t) (tau - 1)];
-        const float b = yinD[(size_t) tau];
-        const float c = yinD[(size_t) (tau + 1)];
-        const float denom = a - 2.f * b + c;
-        float tauF = denom != 0.f ? ((float) tau + 0.5f * (a - c) / denom) : (float) tau;
+        const float ya = yinD[(size_t) (tau - 1)];
+        const float yb = yinD[(size_t) tau];
+        const float yc = yinD[(size_t) (tau + 1)];
+        const float denom = ya - 2.f * yb + yc;
+        float tauF = std::abs(denom) > 1.0e-12f ? ((float) tau + 0.5f * (ya - yc) / denom) : (float) tau;
         if (tauF < 1.f)
             tauF = (float) tau;
         float f0 = srDec / tauF;
@@ -839,13 +1137,13 @@ void VocoderEngine::tickPitchSample(float mono)
     const float v3a = mono - decA2;
     const float v1a = lpA1 * decA1 + lpA2 * v3a;
     const float v2a = decA2 + lpA2 * decA1 + lpA3 * v3a;
-    decA1 = v1a + v1a - decA1;
-    decA2 = v2a + v2a - decA2;
+    decA1 = 2.f * v1a - decA1;
+    decA2 = 2.f * v2a - decA2;
     const float v3b = v2a - decB2;
     const float v1b = lpA1 * decB1 + lpA2 * v3b;
     const float v2b = decB2 + lpA2 * decB1 + lpA3 * v3b;
-    decB1 = v1b + v1b - decB1;
-    decB2 = v2b + v2b - decB2;
+    decB1 = 2.f * v1b - decB1;
+    decB2 = 2.f * v2b - decB2;
 
     if (++decI >= decim)
     {
@@ -867,8 +1165,8 @@ void VocoderEngine::buildIo(int base, int m, const float* inL, const float* inR,
 {
     for (int n = 0; n < m; ++n)
     {
-        const float iL = inL != nullptr ? inL[base + n] : 0.f;
-        const float iR = inR != nullptr ? inR[base + n] : iL;
+        const float iL = inL != nullptr ? vocSanitize(inL[base + n]) : 0.f;
+        const float iR = inR != nullptr ? vocSanitize(inR[base + n]) : iL;
         subInL[n] = iL;
         subInR[n] = iR;
         if (activeCh == 2)
@@ -911,8 +1209,10 @@ void VocoderEngine::buildIo(int base, int m, const float* inL, const float* inR,
         }
         else if (activeCarrier == 1)
         {
-            cL = extL != nullptr ? extL[base + n] : 0.f;
-            cR = extR != nullptr ? extR[base + n] : 0.f;
+            const float* el = extL;
+            const float* er = extR != nullptr ? extR : el;
+            cL = el != nullptr ? vocSanitize(el[base + n]) : 0.f;
+            cR = er != nullptr ? vocSanitize(er[base + n]) : 0.f;
         }
         else if (activeCarrier == 2)
         {
@@ -937,7 +1237,7 @@ void VocoderEngine::buildIo(int base, int m, const float* inL, const float* inR,
 
 void VocoderEngine::injectUv(int m)
 {
-    if (uvOff)
+    if (uvOff && uvEnv <= 1.0e-6f)
     {
         uvEnv = 0.f;
         return;
@@ -950,17 +1250,20 @@ void VocoderEngine::injectUv(int m)
             subCarL[n] += (randUni() * 2.f - 1.f) * amp;
             subCarR[n] += (randUni() * 2.f - 1.f) * amp;
         }
-        const float total = eAll[n];
-        const float hi = eHi[n];
-        const float rms = total > 1.0e-16f ? std::sqrt(total) : 0.f;
-        const float hf = total > 1.0e-16f ? hi / total : 0.f;
         float target = 0.f;
-        if (rms > uvEnergyLin)
+        if (!uvOff)
         {
-            if (sens >= 99.9f)
-                target = 1.f;
-            else
-                target = std::clamp((hf - uvThr) * 6.6666667f, 0.f, 1.f);
+            const float total = eAll[n];
+            const float hi = eHi[n];
+            const float rms = total > 1.0e-16f ? std::sqrt(total) : 0.f;
+            const float hf = total > 1.0e-16f ? hi / total : 0.f;
+            if (rms > uvEnergyLin)
+            {
+                if (sens >= 99.9f)
+                    target = 1.f;
+                else
+                    target = std::clamp((hf - uvThr) * 6.6666667f, 0.f, 1.f);
+            }
         }
         const float c = target > uvEnv ? cUvAtt : cUvRel;
         uvEnv += c * (target - uvEnv);
@@ -989,20 +1292,77 @@ void VocoderEngine::analyzeSub(int m)
             eAll[n] = eHi[n] = 0.f;
     }
 
-    for (int q = 0; q < nRunQuads; ++q)
+    int q = 0;
+    if constexpr (!LR)
+    {
+        // Process two quads (8 bands) in lockstep to double ILP across the 10-cycle SVF recurrence
+        for (; q + 1 < nRunQuads; q += 2)
+        {
+            Quad& Q0 = quads[(size_t) q];
+            Quad& Q1 = quads[(size_t) (q + 1)];
+            const V4 a10 = Q0.a1, a20 = Q0.a2, a30 = Q0.a3, k0 = Q0.k;
+            const V4 a11 = Q1.a1, a21 = Q1.a2, a31 = Q1.a3, k1 = Q1.k;
+            V4 ic10 = Q0.al1, ic20 = Q0.al2, jc10 = Q0.al3, jc20 = Q0.al4;
+            V4 ic11 = Q1.al1, ic21 = Q1.al2, jc11 = Q1.al3, jc21 = Q1.al4;
+            V4 env0 = Q0.envL, att0 = Q0.att, mix0 = Q0.mix, open0 = Q0.openL, gate0 = Q0.gateL;
+            V4 env1 = Q1.envL, att1 = Q1.att, mix1 = Q1.mix, open1 = Q1.openL, gate1 = Q1.gateL;
+            const V4 baseW0 = Q0.pol * Q0.flat * Q0.retro * ntr;
+            const V4 baseW1 = Q1.pol * Q1.flat * Q1.retro * ntr;
+            const V4 act0 = Q0.active, hi0 = Q0.hi, attT0 = Q0.attTarget;
+            const V4 act1 = Q1.active, hi1 = Q1.hi, attT1 = Q1.attTarget;
+
+            for (int n = 0; n < m; ++n)
+            {
+                const V4 x = V4::splat(subModL[n]);
+                mix0 = mix0 + bmixC * (act0 - mix0);
+                mix1 = mix1 + bmixC * (act1 - mix1);
+                att0 = vmax(att0 + attSmC * (attT0 - att0), zero);
+                att1 = vmax(att1 + attSmC * (attT1 - att1), zero);
+
+                V4 pwr0, pwr1;
+                svf2(x, a10, a20, a30, k0, ic10, ic20, jc10, jc20, pwr0);
+                svf2(x, a11, a21, a31, k1, ic11, ic21, jc11, jc21, pwr1);
+
+                env0 = followEnv(env0, pwr0, attC, relC);
+                env1 = followEnv(env1, pwr1, attC, relC);
+                followGate(open0, gate0, env0, gateIsOff, openTh, closeTh, gC);
+                followGate(open1, gate1, env1, gateIsOff, openTh, closeTh, gC);
+
+                if constexpr (UV)
+                {
+                    eAll[n] += (pwr0 + pwr1).hsum();
+                    eHi[n] += (pwr0 * hi0 + pwr1 * hi1).hsum();
+                }
+
+                envHistL[q][n] = env0;
+                envHistL[q + 1][n] = env1;
+                wHistL[q][n] = baseW0 * att0 * mix0 * gate0;
+                wHistL[q + 1][n] = baseW1 * att1 * mix1 * gate1;
+            }
+
+            Q0.al1 = ic10; Q0.al2 = ic20; Q0.al3 = jc10; Q0.al4 = jc20;
+            Q0.envL = env0; Q0.att = att0; Q0.mix = mix0; Q0.gateL = gate0; Q0.openL = open0;
+            Q1.al1 = ic11; Q1.al2 = ic21; Q1.al3 = jc11; Q1.al4 = jc21;
+            Q1.envL = env1; Q1.att = att1; Q1.mix = mix1; Q1.gateL = gate1; Q1.openL = open1;
+        }
+    }
+
+    for (; q < nRunQuads; ++q)
     {
         Quad& Q = quads[(size_t) q];
-        V4 a1 = Q.a1, a2 = Q.a2, a3 = Q.a3, k = Q.k;
+        const V4 a1 = Q.a1, a2 = Q.a2, a3 = Q.a3, k = Q.k;
         V4 ic1 = Q.al1, ic2 = Q.al2, jc1 = Q.al3, jc2 = Q.al4;
         V4 env = Q.envL, att = Q.att, mix = Q.mix, open = Q.openL, gate = Q.gateL;
         V4 ic1r = Q.ar1, ic2r = Q.ar2, jc1r = Q.ar3, jc2r = Q.ar4;
         V4 envr = Q.envR, openr = Q.openR, gater = Q.gateR;
-        const V4 pol = Q.pol, flat = Q.flat, retro = Q.retro, active = Q.active, hi = Q.hi, attT = Q.attTarget;
+        const V4 baseW = Q.pol * Q.flat * Q.retro * ntr;
+        const V4 active = Q.active, hi = Q.hi, attT = Q.attTarget;
 
         for (int n = 0; n < m; ++n)
         {
             mix = mix + bmixC * (active - mix);
             att = vmax(att + attSmC * (attT - att), zero);
+            const V4 wCommon = baseW * att * mix;
 
             V4 power;
             svf2(V4::splat(subModL[n]), a1, a2, a3, k, ic1, ic2, jc1, jc2, power);
@@ -1010,11 +1370,12 @@ void VocoderEngine::analyzeSub(int m)
             followGate(open, gate, env, gateIsOff, openTh, closeTh, gC);
             if constexpr (UV)
             {
-                eAll[n] += power.hsum();
-                eHi[n] += (power * hi).hsum();
+                const float eScale = LR ? 0.5f : 1.f;
+                eAll[n] += eScale * power.hsum();
+                eHi[n] += eScale * (power * hi).hsum();
             }
             envHistL[q][n] = env;
-            wHistL[q][n] = pol * flat * retro * ntr * att * mix * gate;
+            wHistL[q][n] = wCommon * gate;
 
             if constexpr (LR)
             {
@@ -1024,11 +1385,11 @@ void VocoderEngine::analyzeSub(int m)
                 followGate(openr, gater, envr, gateIsOff, openTh, closeTh, gC);
                 if constexpr (UV)
                 {
-                    eAll[n] += powerR.hsum();
-                    eHi[n] += (powerR * hi).hsum();
+                    eAll[n] += 0.5f * powerR.hsum();
+                    eHi[n] += 0.5f * (powerR * hi).hsum();
                 }
                 envHistR[q][n] = envr;
-                wHistR[q][n] = pol * flat * retro * ntr * att * mix * gater;
+                wHistR[q][n] = wCommon * gater;
             }
         }
 
@@ -1060,6 +1421,7 @@ void VocoderEngine::synthSub(int m)
     const V4 zero = V4::splat(0.f);
     const V4 enhA = V4::splat(cEnhAtt);
     const V4 enhR = V4::splat(cEnhRel);
+    const bool mono = activeCh == 0;
 
     for (int q = 0; q < nRunQuads; ++q)
     {
@@ -1082,9 +1444,13 @@ void VocoderEngine::synthSub(int m)
             }
             else
             {
-                subSumL[n] += (bp * gHistL[q][n]).hsum();
+                const float sL = (bp * gHistL[q][n]).hsum();
+                subSumL[n] += sL;
                 if constexpr (Share)
-                    subSumR[n] += (bp * gHistR[q][n]).hsum();
+                {
+                    if (!mono)
+                        subSumR[n] += lrMode ? (bp * gHistR[q][n]).hsum() : sL;
+                }
             }
 
             if constexpr (!Share)
@@ -1136,6 +1502,9 @@ void VocoderEngine::precomputeGains(int m)
     const V4 one = V4::splat(1.f);
     const V4 invEnh = V4::splat(kInvRefEnh);
     const V4 tiny = V4::splat(1.0e-12f);
+    const float wDepth = std::clamp(depthBlend, 0.f, 1.f);
+    const V4 wVec = V4::splat(wDepth);
+    const V4 oneMinusW = V4::splat(1.f - wDepth);
 
     for (int q = 0; q < nRunQuads; ++q)
     {
@@ -1167,8 +1536,10 @@ void VocoderEngine::precomputeGains(int m)
                     go = vmin(vmax(fastExp2(kk * fastLog2(bOff)), zero), cap);
                     gn = vmin(vmax(fastExp2(kk * fastLog2(bOn)), zero), cap);
                 }
-                const V4 g = go * V4::splat(1.f - em) + gn * V4::splat(em);
-                return vsel(alive, g, zero);
+                V4 g = vsel(alive, go * V4::splat(1.f - em) + gn * V4::splat(em), zero);
+                if (wDepth < 1.f)
+                    g = oneMinusW + wVec * g;
+                return g;
             };
 
             gHistL[q][n] = gain(envHistL[q][n]) * wHistL[q][n];
@@ -1182,28 +1553,31 @@ void VocoderEngine::precomputeGains(int m)
 
 void VocoderEngine::applyEnhance(int m, bool share)
 {
-    const V4 one = V4::splat(1.f);
+    const bool mono = activeCh == 0;
     for (int n = 0; n < m; ++n)
     {
         float seen = 0.f;
-        const float flo = std::max(enhPeak * kEnhRel, kEnhAbs);
+        const float enhFloor = std::max(enhPeak * kEnhRel, kEnhAbs);
         const float em = enhArr[n];
         const V4 emS = V4::splat(em);
         const V4 dry = V4::splat(1.f - em);
         for (int q = 0; q < nRunQuads; ++q)
         {
             seen = std::max(seen, rmsHistL[q][n].hmax());
-            const V4 bL = enhBoost(rmsHistL[q][n], flo);
+            const V4 bL = enhBoost(rmsHistL[q][n], enhFloor);
             const V4 mulL = em > 0.999f ? bL : dry + bL * emS;
-            subSumL[n] += (bpHistL[q][n] * mulL * gHistL[q][n]).hsum();
+            const V4 outVecL = bpHistL[q][n] * mulL;
+            const float sL = (outVecL * gHistL[q][n]).hsum();
+            subSumL[n] += sL;
             if (share)
             {
-                subSumR[n] += (bpHistL[q][n] * mulL * gHistR[q][n]).hsum();
+                if (!mono)
+                    subSumR[n] += lrMode ? (outVecL * gHistR[q][n]).hsum() : sL;
             }
             else
             {
                 seen = std::max(seen, rmsHistR[q][n].hmax());
-                const V4 bR = enhBoost(rmsHistR[q][n], flo);
+                const V4 bR = enhBoost(rmsHistR[q][n], enhFloor);
                 const V4 mulR = em > 0.999f ? bR : dry + bR * emS;
                 subSumR[n] += (bpHistR[q][n] * mulR * gHistR[q][n]).hsum();
             }
@@ -1219,11 +1593,15 @@ void VocoderEngine::mixSub(float* outL, float* outR, int base, int m)
 {
     const float trim = kTrim[std::clamp(activeCarrier, 0, 3)];
     const bool mono = activeCh == 0;
+    const float wDepth = depthMode == 0 ? 0.f : std::clamp(depthBlend, 0.f, 1.f);
     for (int n = 0; n < m; ++n)
     {
         float pb = 1.f;
         if (depthMode != 0)
-            pb = enhArr[n] + (1.f - enhArr[n]) * trim;
+        {
+            const float pbFull = enhArr[n] + (1.f - enhArr[n]) * trim;
+            pb = wDepth < 1.f ? (1.f + wDepth * (pbFull - 1.f)) : pbFull;
+        }
         const float sL = subSumL[n] * pb;
         const float sR = mono ? sL : subSumR[n] * pb;
         if (!doEnhance)
@@ -1236,8 +1614,10 @@ void VocoderEngine::mixSub(float* outL, float* outR, int base, int m)
         const float pL = (dL * dryAmt + sL * wetAmt) * lvlArr[n];
         const float pR = (dR * dryAmt + sR * wetAmt) * lvlArr[n];
         const float devS = devArr[n];
-        outL[base + n] = vocSanitize(pL * devS + dL * (1.f - devS));
-        outR[base + n] = vocSanitize(pR * devS + dR * (1.f - devS));
+        // Device On/Off crossfades with the true stereo input (subInL/R), so bypassing in Mono mode
+        // preserves the stereo image instead of collapsing the dry path to mono.
+        outL[base + n] = vocSanitize(pL * devS + subInL[n] * (1.f - devS));
+        outR[base + n] = vocSanitize(pR * devS + subInR[n] * (1.f - devS));
     }
 }
 
@@ -1247,6 +1627,8 @@ void VocoderEngine::publishDisp(float* disp) const
         return;
     for (int i = 0; i < kVocMaxBands; ++i)
         disp[i] = 0.f;
+    if (asleep)
+        return;
     for (int q = 0; q < nRunQuads; ++q)
     {
         alignas(16) float eL[4], eR[4], att[4];
@@ -1256,10 +1638,166 @@ void VocoderEngine::publishDisp(float* disp) const
         for (int i = 0; i < 4; ++i)
         {
             const int b = q * 4 + i;
-            float e = eL[i];
-            if (activeCh == 2)
-                e = std::max(e, eR[i]);
-            disp[b] = e * att[i];
+            if (b < nBands)
+            {
+                float e = eL[i];
+                if (activeCh == 2)
+                    e = std::max(e, eR[i]);
+                disp[b] = e * att[i];
+            }
+        }
+    }
+}
+
+void VocoderEngine::updateDerivedParams(const VocoderParams& p, const float attDb[kVocMaxBands])
+{
+    const bool paramsChanged = !hasCachedParams
+        || std::memcmp(&cachedSr, &sr, sizeof(double)) != 0
+        || !(p == cachedParams);
+    if (paramsChanged)
+    {
+        cachedParams = p;
+        cachedSr = sr;
+        hasCachedParams = true;
+
+        wantCarrier = std::clamp(p.carrier, 0, 3);
+        wantCh = std::clamp(p.channels, 0, 2);
+        nBands = std::clamp(p.bands, 4, 40);
+        nBands -= nBands % 4;
+        if (nBands < 4)
+            nBands = 4;
+        flo = safeClamp(p.rangeLow, 20.f, 2000.f, flo);
+        fhi = safeClamp(p.rangeHigh, 1000.f, 20000.f, fhi);
+        bwPct = safeClamp(p.bw, 10.f, 200.f, bwPct);
+        retro = p.filterMode != 0;
+        formantTarget = safeClamp(p.formantSt, -12.f, 12.f, formantSm);
+        if (std::abs(formantTarget - formantSm) > 1.0e-5f)
+            coefSettling = true;
+
+        depthTarget = safeClamp(p.depth, 0.f, 200.f, depthSm);
+        if (depthTarget < 20.f)
+        {
+            asleep = false;
+            silenceHold = 0;
+        }
+
+        const float gateDb = safeClamp(p.gateDb, -96.f, 0.f, -96.f);
+        gateOff = gateDb <= -95.5f;
+        const double gdb = std::max((double) gateDb, -96.0);
+        gateOpenTh = (float) std::exp(gdb * kDb2A);
+        gateCloseTh = (float) std::exp((gdb - 3.0) * kDb2A);
+
+        sens = safeClamp(p.sens, 0.f, 100.f, sens);
+        const float unvoicedDb = safeClamp(p.unvoicedDb, -96.f, 0.f, -96.f);
+        uvOff = unvoicedDb <= -95.5f || sens <= 0.f;
+        uvLin = unvoicedDb <= -95.5f ? 0.f : (float) std::exp((double) unvoicedDb * kDb2A);
+        uvThr = (100.f - sens) * 0.0084f;
+        uvEnergyLin = (float) std::exp(-46.0 * kDb2A);
+
+        const float attackMs = safeClamp(p.attackMs, 0.05f, 100.f, 5.f);
+        const float releaseMs = safeClamp(p.releaseMs, 0.2f, 1000.f, 80.f);
+        const double atk = std::max(0.05, (double) attackMs) * 0.001;
+        const double rel = std::max(0.2, (double) releaseMs) * 0.001;
+        cAtt = onePole(atk, sr);
+        cRel = onePole(rel, sr);
+        cEnhAtt = onePole(0.004, sr);
+        cEnhRel = onePole(0.015, sr);
+        cEnhPkAtt = onePole(0.001, sr);
+        cEnhPkRel = onePole(0.200, sr);
+        cGate = onePole(0.004, sr);
+        cDuck = onePole(0.0035, sr);
+        cMacro = onePole(0.008, sr);
+        cBmix = onePole(0.012, sr);
+        cAttSm = onePole(0.008, sr);
+        cGlide = onePole(0.0025, sr);
+        cUvAtt = onePole(p.uvSpeed > 0 ? 0.004 : 0.012, sr);
+        cUvRel = onePole(p.uvSpeed > 0 ? 0.0015 : 0.0025, sr);
+
+        const float levelDb = safeClamp(p.levelDb, -24.f, 24.f, 0.f);
+        lvlTarget = (float) std::exp((double) levelDb * kDb2A);
+        const float dryWet = safeClamp(p.dryWet, 0.f, 100.f, 100.f);
+        wetTarget = std::clamp(dryWet * 0.01f, 0.f, 1.f);
+        devTarget = p.deviceOn ? 1.f : 0.f;
+        if (!vocIsFinite(dev) || std::abs(devTarget - dev) > 1.0e-5f)
+        {
+            asleep = false;
+            silenceHold = 0;
+        }
+        enhTarget = p.enhance ? 1.f : 0.f;
+
+        noiseRate = safeClamp(p.noiseRate, 0.f, 1.f, noiseRate);
+        noiseCrackle = safeClamp(p.noiseCrackle, 0.f, 1.f, noiseCrackle);
+        const float rateHz = 300.f * std::exp(noiseRate * std::log((float) sr / 300.f));
+        holdN = std::max(1.f, (float) sr / rateHz);
+
+        oscWave = std::clamp(p.oscWave, 0, 3);
+        ptTranspose = (float) std::exp(std::clamp(p.oscPitch, -24, 24) * kLn2 / 12.0);
+        tLow = safeClamp(p.trackLow, 20.f, 1000.f, tLow);
+        tHigh = std::max(tLow + 10.f, safeClamp(p.trackHigh, 100.f, 2000.f, tHigh));
+        nTrim = (float) std::exp(-0.40 * std::log((double) nBands / 20.0) / kLn2 * kDb2A);
+        updateActiveMask();
+    }
+
+    // Bands / Retro / sample-rate rebuild the bank immediately. Range and BW
+    // are continuous, so while they are automated the solver waits until
+    // ~128 samples have passed since the last design. The key stays stale
+    // until then, which keeps designPending alive across blocks.
+    {
+        DesignKey next;
+        next.bands = nBands;
+        next.low = (int) std::lround((double) flo * 100.0);
+        next.high = (int) std::lround((double) fhi * 100.0);
+        next.bw = (int) std::lround((double) bwPct * 100.0);
+        next.retro = retro ? 1 : 0;
+        next.sampleRate = (int) std::lround(sr);
+        if (!(next == key) || designPending)
+        {
+            const bool modeChanged = key.bands < 0
+                || next.bands != key.bands
+                || next.retro != key.retro
+                || next.sampleRate != key.sampleRate;
+            if (modeChanged || designHoldSamples <= 0)
+            {
+                designTargets();
+                key = next;
+                designPending = false;
+                designHoldSamples = 128;
+            }
+            else
+            {
+                designPending = true;
+            }
+        }
+    }
+
+    if (attDb != nullptr)
+    {
+        bool attChanged = paramsChanged;
+        if (!attChanged)
+        {
+            for (int i = 0; i < kVocMaxBands; ++i)
+            {
+                if (std::memcmp(&attDb[i], &cachedAttDb[(size_t) i], sizeof(float)) != 0)
+                {
+                    attChanged = true;
+                    break;
+                }
+            }
+        }
+        if (attChanged)
+        {
+            for (int q = 0; q < kVocQuads; ++q)
+            {
+                alignas(16) float t[4];
+                for (int i = 0; i < 4; ++i)
+                {
+                    const int idx = q * 4 + i;
+                    cachedAttDb[(size_t) idx] = attDb[idx];
+                    const float db = safeClamp(attDb[idx], -60.f, 0.f, 0.f);
+                    t[i] = (float) std::exp((double) db * kDb2A);
+                }
+                quads[(size_t) q].attTarget = V4::load(t);
+            }
         }
     }
 }
@@ -1276,99 +1814,11 @@ void VocoderEngine::process(const float* modL, const float* modR,
 
     const NoDenorms flushDenorms;
 
-    wantCarrier = std::clamp(p.carrier, 0, 3);
-    wantCh = std::clamp(p.channels, 0, 2);
-    nBands = std::clamp(p.bands, 4, 40);
-    nBands -= nBands % 4;
-    if (nBands < 4)
-        nBands = 4;
-    flo = std::clamp(p.rangeLow, 20.f, 2000.f);
-    fhi = std::clamp(p.rangeHigh, 1000.f, 20000.f);
-    bwPct = std::clamp(p.bw, 10.f, 200.f);
-    retro = p.filterMode != 0;
-    formantTarget = std::clamp(p.formantSt, -12.f, 12.f);
+    if (designHoldSamples > 0)
+        designHoldSamples = std::max(0, designHoldSamples - numSamples);
 
-    if (std::abs(p.depth - 100.f) < 0.01f)
-        depthMode = 1;
-    else if (p.depth < 0.01f)
-        depthMode = 0;
-    else
-    {
-        depthMode = 2;
-        depthK = p.depth * 0.01f;
-    }
-
-    gateOff = p.gateDb <= -95.5f;
-    const double gdb = std::max((double) p.gateDb, -96.0);
-    gateOpenTh = (float) std::exp(gdb * kDb2A);
-    gateCloseTh = (float) std::exp((gdb - 3.0) * kDb2A);
-
-    sens = std::clamp(p.sens, 0.f, 100.f);
-    uvOff = p.unvoicedDb <= -95.5f || sens <= 0.f;
-    uvLin = uvOff ? 0.f : (float) std::exp((double) p.unvoicedDb * kDb2A);
-    uvThr = (100.f - sens) * 0.0084f;
-    uvEnergyLin = (float) std::exp(-46.0 * kDb2A);
-
-    const double atk = std::max(0.05, (double) p.attackMs) * 0.001;
-    const double rel = std::max(0.2, (double) p.releaseMs) * 0.001;
-    cAtt = onePole(atk, sr);
-    cRel = onePole(rel, sr);
-    cEnhAtt = onePole(0.004, sr);
-    cEnhRel = onePole(0.015, sr);
-    cEnhPkAtt = onePole(0.001, sr);
-    cEnhPkRel = onePole(0.200, sr);
-    cGate = onePole(0.004, sr);
-    cDuck = onePole(0.0035, sr);
-    cMacro = onePole(0.008, sr);
-    cBmix = onePole(0.012, sr);
-    cAttSm = onePole(0.008, sr);
-    cGlide = onePole(0.0025, sr);
-    cUvAtt = onePole(p.uvSpeed > 0 ? 0.004 : 0.012, sr);
-    cUvRel = onePole(p.uvSpeed > 0 ? 0.0025 : 0.0015, sr);
-
-    lvlTarget = (float) std::exp(std::clamp((double) p.levelDb, -24.0, 24.0) * kDb2A);
-    wetTarget = std::clamp(p.dryWet * 0.01f, 0.f, 1.f);
-    devTarget = p.deviceOn ? 1.f : 0.f;
-    enhTarget = p.enhance ? 1.f : 0.f;
-
-    noiseRate = std::clamp(p.noiseRate, 0.f, 1.f);
-    noiseCrackle = std::clamp(p.noiseCrackle, 0.f, 1.f);
-    const float rateHz = 300.f * std::exp(noiseRate * std::log((float) sr / 300.f));
-    holdN = std::max(1.f, (float) sr / rateHz);
-
-    oscWave = std::clamp(p.oscWave, 0, 3);
-    ptTranspose = (float) std::exp(std::clamp(p.oscPitch, -24, 24) * kLn2 / 12.0);
-    tLow = std::clamp(p.trackLow, 20.f, 1000.f);
-    tHigh = std::max(tLow + 10.f, std::clamp(p.trackHigh, 100.f, 2000.f));
-    nTrim = (float) std::exp(-0.40 * std::log((double) nBands / 20.0) / kLn2 * kDb2A);
-
-    DesignKey next;
-    next.bands = nBands;
-    next.low = (int) std::lround((double) flo * 100.0);
-    next.high = (int) std::lround((double) fhi * 100.0);
-    next.bw = (int) std::lround((double) bwPct * 100.0);
-    next.retro = retro ? 1 : 0;
-    next.sampleRate = (int) std::lround(sr);
-    if (!(next == key))
-    {
-        designTargets();
-        key = next;
-    }
-
-    updateActiveMask();
-    if (attDb != nullptr)
-    {
-        for (int q = 0; q < kVocQuads; ++q)
-        {
-            alignas(16) float t[4];
-            for (int i = 0; i < 4; ++i)
-            {
-                const float db = std::clamp(attDb[q * 4 + i], -60.f, 0.f);
-                t[i] = (float) std::exp((double) db * kDb2A);
-            }
-            quads[(size_t) q].attTarget = V4::load(t);
-        }
-    }
+    updateDerivedParams(p, attDb);
+    sanitizeFilterStates();
 
     if (boot)
     {
@@ -1380,6 +1830,17 @@ void VocoderEngine::process(const float* modL, const float* modR,
         wet = wetTarget;
         dev = devTarget;
         enhMix = enhTarget;
+        depthSm = depthTarget;
+        if (std::abs(depthSm - 100.f) < 0.01f)
+            depthMode = 1;
+        else if (depthSm < 0.01f)
+            depthMode = 0;
+        else
+        {
+            depthMode = 2;
+            depthK = depthSm * 0.01f;
+        }
+        depthBlend = depthSm < 20.f ? std::clamp(depthSm * 0.05f, 0.f, 1.f) : 1.f;
         formantSm = formantTarget;
         const V4 one = V4::splat(1.f);
         for (auto& Q : quads)
@@ -1388,28 +1849,115 @@ void VocoderEngine::process(const float* modL, const float* modR,
             Q.att = Q.attTarget;
             Q.gateL = Q.gateR = Q.openL = Q.openR = one;
         }
+        smoothCoeffs(kVocSub, true);
+        boot = false;
     }
 
-    smoothCoeffs(numSamples, boot);
-    boot = false;
+    // Fast path 1: Device Off settled -> true stereo bypass
+    if (devTarget == 0.f && dev < 1.0e-5f)
+    {
+        dev = 0.f;
+        if (!devCleared)
+        {
+            clearAnalysisIC(true);
+            clearSynthIC();
+            enhPeak = 0.f;
+            uvEnv = 0.f;
+            devCleared = true;
+        }
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float iL = modL != nullptr ? vocSanitize(modL[i]) : 0.f;
+            const float iR = modR != nullptr ? vocSanitize(modR[i]) : iL;
+            outL[i] = iL;
+            outR[i] = iR;
+        }
+        if (dispEnv != nullptr)
+            std::memset(dispEnv, 0, sizeof(float) * kVocMaxBands);
+        return;
+    }
+    devCleared = false;
+
+    // Check if modulator input is silent across the whole block
+    float inPeak = 0.f;
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const float iL = modL != nullptr ? vocSanitize(modL[i]) : 0.f;
+        const float iR = modR != nullptr ? vocSanitize(modR[i]) : iL;
+        inPeak = std::max(inPeak, std::max(std::abs(iL), std::abs(iR)));
+    }
+    const bool quietIn = inPeak < 1.0e-7f;
+
+    // Fast path 2: Idle sleep gate when modulator is silent and envelopes have decayed
+    if (asleep && quietIn && depthTarget >= 20.f && depthBlend >= 1.f && depthMode != 0
+        && !coefSettling && !pending && wantCarrier == activeCarrier && wantCh == activeCh
+        && vocIsFinite(dev) && std::abs(devTarget - dev) < 1.0e-5f)
+    {
+        std::memset(outL, 0, sizeof(float) * (size_t) numSamples);
+        std::memset(outR, 0, sizeof(float) * (size_t) numSamples);
+        if (dispEnv != nullptr)
+            std::memset(dispEnv, 0, sizeof(float) * kVocMaxBands);
+        return;
+    }
+    if (!quietIn || depthTarget < 20.f || depthBlend < 1.f || depthMode == 0)
+    {
+        asleep = false;
+        silenceHold = 0;
+    }
+
     computeRunQuads();
 
+    float outPeak = 0.f;
     int offset = 0;
     while (offset < numSamples)
     {
         const int m = std::min(kVocSub, numSamples - offset);
+        if (coefSettling)
+            smoothCoeffs(m, false);
+
+        if (std::memcmp(&depthSm, &depthTarget, sizeof(float)) != 0)
+        {
+            const float da = 1.f - std::exp(-(float) m / (0.012f * (float) sr));
+            depthSm += da * (depthTarget - depthSm);
+            if (std::abs(depthTarget - depthSm) < 0.005f)
+                depthSm = depthTarget;
+        }
+        if (std::abs(depthSm - 100.f) < 0.01f)
+            depthMode = 1;
+        else if (depthSm < 0.01f)
+            depthMode = 0;
+        else
+        {
+            depthMode = 2;
+            depthK = depthSm * 0.01f;
+        }
+
+        const float blendTarget = depthSm < 20.f ? std::clamp(depthSm * 0.05f, 0.f, 1.f) : 1.f;
+        if (std::memcmp(&depthBlend, &blendTarget, sizeof(float)) != 0)
+        {
+            const float ba = 1.f - std::exp(-(float) m / (0.018f * (float) sr));
+            depthBlend += ba * (blendTarget - depthBlend);
+            if (std::abs(blendTarget - depthBlend) < 0.0005f)
+                depthBlend = blendTarget;
+        }
+        if (depthBlend > 0.f && depthMode == 0)
+        {
+            depthMode = 2;
+            depthK = std::max(depthSm * 0.01f, 0.0001f);
+        }
+
         considerRoute();
         lrMode = activeCh == 2;
-        shareSynth = activeCh == 0 || (activeCarrier == 3 && uvOff);
+        shareSynth = activeCh == 0 || (activeCarrier == 3 && uvOff && uvEnv <= 1.0e-6f);
 
         const bool enhOff = enhMix < 0.001f && enhTarget < 0.001f;
         const bool enhOn = enhMix > 0.999f && enhTarget > 0.999f;
         doEnhance = enhMix > 0.0005f || enhTarget > 0.0005f;
-        if (depthMode == 0)
+        if (depthMode == 0 && depthBlend <= 0.f)
             gainLaw = 0;
-        else if (depthMode == 1 && enhOff)
+        else if (depthMode == 1 && depthBlend >= 1.f && enhOff)
             gainLaw = 1;
-        else if (depthMode == 1 && enhOn)
+        else if (depthMode == 1 && depthBlend >= 1.f && enhOn)
             gainLaw = 2;
         else
             gainLaw = 3;
@@ -1449,7 +1997,35 @@ void VocoderEngine::process(const float* modL, const float* modR,
         }
 
         mixSub(outL, outR, offset, m);
+        for (int n = 0; n < m; ++n)
+            outPeak = std::max(outPeak, std::max(std::abs(outL[offset + n]), std::abs(outR[offset + n])));
+        sanitizeFilterStates();
+        computeRunQuads();
         offset += m;
+    }
+
+    if (quietIn && outPeak < 1.0e-7f && depthMode != 0 && depthTarget >= 20.f && depthBlend >= 1.f)
+    {
+        float maxEnv = 0.f;
+        for (int q = 0; q < nRunQuads; ++q)
+            maxEnv = std::max(maxEnv, std::max(quads[(size_t) q].envL.hmax(), quads[(size_t) q].envR.hmax()));
+        if (maxEnv < 1.0e-8f)
+        {
+            silenceHold += numSamples;
+            if (silenceHold >= silenceNeed)
+            {
+                asleep = true;
+                resetPitchRing();
+            }
+        }
+        else
+        {
+            silenceHold = 0;
+        }
+    }
+    else
+    {
+        silenceHold = 0;
     }
 
     publishDisp(dispEnv);

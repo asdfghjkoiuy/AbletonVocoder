@@ -71,6 +71,7 @@ target_sources(vocoder_juce_bench PRIVATE
     Source/VocoderEngine.cpp
 )
 target_compile_definitions(vocoder_juce_bench PRIVATE
+    VOC_ENABLE_TEST_HOOKS=1
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
@@ -90,12 +91,14 @@ target_link_libraries(vocoder_juce_bench PRIVATE
 function(vocoder_release_flags target)
     target_compile_options(${target} PRIVATE
         $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:AppleClang,Clang,GNU>>:-O3>
-        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:AppleClang,Clang,GNU>>:-ffast-math>
-        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:AppleClang,Clang,GNU>>:-flto>
+        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:AppleClang,Clang,GNU>>:-fno-math-errno>
+        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:AppleClang,Clang,GNU>>:-ffp-contract=fast>
+        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:AppleClang,Clang,GNU>>:-fno-trapping-math>
     )
     if(APPLE)
         target_compile_options(${target} PRIVATE
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-mcpu=native>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-Xarch_arm64>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-mcpu=apple-m1>
         )
         target_link_libraries(${target} PRIVATE "-framework Accelerate")
     endif()

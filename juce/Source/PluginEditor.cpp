@@ -1,6 +1,7 @@
 #include "PluginEditor.h"
 
 #include <cmath>
+#include <cstring>
 
 namespace
 {
@@ -16,6 +17,14 @@ const juce::Colour kInk(36, 24, 14);
 const juce::Colour kLine(18, 18, 20);
 const juce::Colour kKnobC(22, 24, 26);
 const juce::Colour kTrack(78, 80, 84);
+
+constexpr const char* kAllParamIds[25] = {
+    voc::carrier, voc::bands, voc::rangeLow, voc::rangeHigh, voc::bw,
+    voc::filterMode, voc::gate, voc::level, voc::depth, voc::attack,
+    voc::release, voc::formant, voc::dryWet, voc::channels, voc::enhance,
+    voc::unvoiced, voc::sens, voc::uvSpeed, voc::noiseRate, voc::noiseCrackle,
+    voc::oscWave, voc::oscPitch, voc::trackLow, voc::trackHigh, voc::deviceOn
+};
 
 struct Geo
 {
@@ -188,14 +197,14 @@ void stroke(juce::Graphics& g, juce::Rectangle<float> r)
     g.drawRect(r, 1.f);
 }
 
-void drawDrop(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& text, bool open, float s, float fs)
+void drawDrop(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& text, bool open, float s, const juce::Font& font)
 {
     g.setColour(kPanel);
     fillRound(g, r);
     g.setColour(open ? kOrange : kTeal);
     stroke(g, r);
     g.setColour(kText);
-    g.setFont(juce::Font(juce::FontOptions("Arial", fs, juce::Font::plain)));
+    g.setFont(font);
     g.drawText(text, r.reduced(s * 6.f, 0.f).withTrimmedRight(s * 10.f), juce::Justification::centredLeft, false);
     juce::Path tri;
     const float cx = r.getRight() - s * 9.f;
@@ -205,37 +214,38 @@ void drawDrop(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& t
     g.fillPath(tri);
 }
 
-void drawBtn(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& text, bool on, float fs)
+void drawBtn(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& text, bool on, const juce::Font& font)
 {
     g.setColour(on ? kOrange : kPanel);
     fillRound(g, r);
     g.setColour(kLine);
     stroke(g, r);
     g.setColour(on ? kInk : kText);
-    g.setFont(juce::Font(juce::FontOptions("Arial", fs, juce::Font::plain)));
+    g.setFont(font);
     g.drawText(text, r, juce::Justification::centred, false);
 }
 
-void drawNum(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& text, float fs)
+void drawNum(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& text, const juce::Font& font)
 {
     g.setColour(kPanel);
     fillRound(g, r);
     g.setColour(kLine);
     stroke(g, r);
     g.setColour(kTeal);
-    g.setFont(juce::Font(juce::FontOptions("Arial", fs, juce::Font::plain)));
+    g.setFont(font);
     g.drawText(text, r, juce::Justification::centred, false);
 }
 
-void drawCaption(juce::Graphics& g, float x, float y, const juce::String& text, float fm)
+void drawCaption(juce::Graphics& g, float x, float y, const juce::String& text, float fm, const juce::Font& fontMini)
 {
     g.setColour(kDim);
-    g.setFont(juce::Font(juce::FontOptions("Arial", fm, juce::Font::plain)));
+    g.setFont(fontMini);
     g.drawText(text, juce::Rectangle<float>(x, y - fm - 2.f, 80.f, fm + 1.f), juce::Justification::bottomLeft, false);
 }
 
 void drawKnob(juce::Graphics& g, juce::Point<float> c, float r, float norm, const juce::String& cap,
-              const juce::String& val, float s, float fs, float fm)
+              const juce::String& val, float s, float fs, float fm,
+              const juce::Font& fontStd, const juce::Font& fontMini)
 {
     norm = std::clamp(norm, 0.f, 1.f);
     g.setColour(kKnobC);
@@ -262,11 +272,11 @@ void drawKnob(juce::Graphics& g, juce::Point<float> c, float r, float norm, cons
                c.x + std::sin(ang) * rad, c.y - std::cos(ang) * rad,
                std::max(1.2f, s));
     g.setColour(kDim);
-    g.setFont(juce::Font(juce::FontOptions("Arial", fm, juce::Font::plain)));
+    g.setFont(fontMini);
     g.drawText(cap, juce::Rectangle<float>(c.x - s * 46.f, c.y - r - fm - s * 2.f, s * 92.f, fm + 1.f),
                juce::Justification::centred, false);
     g.setColour(kTeal);
-    g.setFont(juce::Font(juce::FontOptions("Arial", fs, juce::Font::plain)));
+    g.setFont(fontStd);
     g.drawText(val, juce::Rectangle<float>(c.x - s * 48.f, c.y + r + s, s * 96.f, fs + 2.f),
                juce::Justification::centred, false);
 }
@@ -287,12 +297,16 @@ AbletonVocoderEditor::AbletonVocoderEditor(AbletonVocoderProcessor& p)
     : AudioProcessorEditor(&p), proc(p)
 {
     setOpaque(true);
+    setWantsKeyboardFocus(true);
+    setMouseClickGrabsKeyboardFocus(false);
     setResizable(true, true);
     setResizeLimits(468, 174, 2340, 870);
     if (auto* c = getConstrainer())
         c->setFixedAspectRatio(780.0 / 290.0);
     setSize(780, 290);
-    startTimerHz(60);
+    for (float& db : lastDispDb)
+        db = -120.f;
+    startTimerHz(30);
 }
 
 AbletonVocoderEditor::~AbletonVocoderEditor() = default;
@@ -300,7 +314,7 @@ AbletonVocoderEditor::~AbletonVocoderEditor() = default;
 float AbletonVocoderEditor::param(const char* id) const
 {
     if (auto* v = proc.apvts.getRawParameterValue(id))
-        return v->load();
+        return v->load(std::memory_order_relaxed);
     return 0.f;
 }
 
@@ -322,14 +336,123 @@ void AbletonVocoderEditor::endParam(const char* id)
         p->endChangeGesture();
 }
 
+juce::Rectangle<float> AbletonVocoderEditor::getMenuRect() const
+{
+    if (menu <= 0)
+        return {};
+    const Geo geo = makeGeo((float) getWidth(), (float) getHeight());
+    const float nf = menu == 2 ? 10.f : 4.f;
+    const float ih = geo.S(18.f);
+    juce::Rectangle<float> anchor = menu == 1 ? geo.carrier : menu == 2 ? geo.bands : geo.wave;
+    float y = menu == 2 ? anchor.getY() - nf * ih : anchor.getBottom() + geo.S(2.f);
+    float x = anchor.getX();
+    float w = menu == 2 ? std::max(anchor.getWidth(), geo.S(56.f)) : anchor.getWidth();
+    if (y < 2.f)
+        y = 2.f;
+    if (y + nf * ih > (float) getHeight() - 2.f)
+        y = (float) getHeight() - 2.f - nf * ih;
+    return { x, y, w, nf * ih };
+}
+
+int AbletonVocoderEditor::getMenuItemAt(juce::Point<float> p) const
+{
+    if (menu <= 0)
+        return -1;
+    const auto area = getMenuRect();
+    if (!area.contains(p))
+        return -1;
+    const int n = menu == 2 ? 10 : 4;
+    const float ih = area.getHeight() / (float) n;
+    const int j = (int) std::floor((p.y - area.getY()) / std::max(ih, 1.f));
+    return std::clamp(j, 0, n - 1);
+}
+
+void AbletonVocoderEditor::focusLost(FocusChangeType)
+{
+    if (menu != 0)
+    {
+        menu = 0;
+        menuArmed = false;
+        menuHover = -1;
+        repaint();
+    }
+}
+
+bool AbletonVocoderEditor::keyPressed(const juce::KeyPress& key)
+{
+    if (menu != 0 && key == juce::KeyPress::escapeKey)
+    {
+        menu = 0;
+        menuArmed = false;
+        menuHover = -1;
+        giveAwayKeyboardFocus();
+        repaint();
+        return true;
+    }
+    return false;
+}
+
 void AbletonVocoderEditor::timerCallback()
 {
-    repaint();
+    // If Wave menu is open while Carrier was automated away from Pitch Tracking, close it
+    if (menu == 3 && (int) std::lround(param(voc::carrier)) != 3)
+    {
+        menu = 0;
+        menuArmed = false;
+        menuHover = -1;
+        repaint();
+        return;
+    }
+
+    bool dirty = false;
+    const uint32_t rev = proc.stateRevision.load(std::memory_order_relaxed);
+    if (rev != lastStateRev)
+    {
+        lastStateRev = rev;
+        dirty = true;
+    }
+
+    for (int i = 0; i < 25; ++i)
+    {
+        const float v = param(kAllParamIds[i]);
+        if (std::memcmp(&v, &lastParamSnap[i], sizeof(float)) != 0)
+        {
+            lastParamSnap[i] = v;
+            dirty = true;
+        }
+    }
+
+    bool barsDirty = false;
+    const int nBands = ((int) std::lround(param(voc::bands)) + 1) * 4;
+    for (int i = 0; i < nBands; ++i)
+    {
+        const float env = proc.dispEnv[i].load(std::memory_order_relaxed);
+        const float db = env > 1.0e-12f ? std::max(-60.f, 20.f * std::log10(env)) : -60.f;
+        if (std::abs(db - lastDispDb[i]) > 0.25f)
+        {
+            lastDispDb[i] = db;
+            barsDirty = true;
+        }
+    }
+
+    if (dirty)
+    {
+        repaint();
+    }
+    else if (barsDirty)
+    {
+        const Geo geo = makeGeo((float) getWidth(), (float) getHeight());
+        repaint(geo.disp.toNearestInt().expanded(2));
+    }
 }
 
 void AbletonVocoderEditor::paint(juce::Graphics& g)
 {
     const Geo geo = makeGeo((float) getWidth(), (float) getHeight());
+    const juce::Font fontStd(juce::FontOptions("Arial", geo.fs, juce::Font::plain));
+    const juce::Font fontMini(juce::FontOptions("Arial", geo.fm, juce::Font::plain));
+    const juce::Font fontBold(juce::FontOptions("Arial", geo.fb, juce::Font::bold));
+
     const int carrier = (int) std::lround(param(voc::carrier));
     const int bandIdx = (int) std::lround(param(voc::bands));
     const int nBands = (bandIdx + 1) * 4;
@@ -367,12 +490,12 @@ void AbletonVocoderEditor::paint(juce::Graphics& g)
         g.drawEllipse(geo.power.x - geo.powerR, geo.power.y - geo.powerR, geo.powerR * 2.f, geo.powerR * 2.f, 1.f);
     }
     g.setColour(kText);
-    g.setFont(juce::Font(juce::FontOptions("Arial", geo.fb, juce::Font::bold)));
+    g.setFont(fontBold);
     g.drawText("Vocoder", juce::Rectangle<float>(geo.X(30), geo.Y(4), geo.S(160), geo.S(20)),
                juce::Justification::centredLeft, false);
 
-    drawCaption(g, geo.carrier.getX(), geo.carrier.getY(), "Carrier", geo.fm);
-    drawDrop(g, geo.carrier, carrierName(carrier), menu == 1, geo.s, geo.fs);
+    drawCaption(g, geo.carrier.getX(), geo.carrier.getY(), "Carrier", geo.fm, fontMini);
+    drawDrop(g, geo.carrier, carrierName(carrier), menu == 1, geo.s, fontStd);
     g.setColour(kPanel);
     g.fillRect(geo.ctx);
     g.setColour(kLine);
@@ -388,7 +511,7 @@ void AbletonVocoderEditor::paint(juce::Graphics& g)
         g.drawLine(geo.pad.getCentreX(), geo.pad.getY() + geo.S(3), geo.pad.getCentreX(), geo.pad.getBottom() - geo.S(3));
         g.drawLine(geo.pad.getX() + geo.S(3), geo.pad.getCentreY(), geo.pad.getRight() - geo.S(3), geo.pad.getCentreY());
         g.setColour(kDim);
-        g.setFont(juce::Font(juce::FontOptions("Arial", geo.fm, juce::Font::plain)));
+        g.setFont(fontMini);
         g.drawText("Crackle " + juce::String(std::clamp(crack, 0.f, 1.f), 2),
                    geo.pad.reduced(geo.S(4), geo.S(3)).removeFromTop(geo.fm + 2.f), juce::Justification::topLeft, false);
         g.drawText("Rate " + juce::String(std::clamp(rate, 0.f, 1.f), 2),
@@ -404,14 +527,14 @@ void AbletonVocoderEditor::paint(juce::Graphics& g)
     }
     else if (carrier == 3)
     {
-        drawDrop(g, geo.wave, waveName(wave), menu == 3, geo.s, geo.fs);
+        drawDrop(g, geo.wave, waveName(wave), menu == 3, geo.s, fontStd);
         auto row = [&](juce::Rectangle<float> r, const juce::String& name, const juce::String& value)
         {
             g.setColour(kDim);
-            g.setFont(juce::Font(juce::FontOptions("Arial", geo.fm, juce::Font::plain)));
+            g.setFont(fontMini);
             g.drawText(name, r.reduced(geo.S(4), 0).removeFromLeft(geo.S(42)), juce::Justification::centredLeft, false);
             g.setColour(kTeal);
-            g.setFont(juce::Font(juce::FontOptions("Arial", geo.fs, juce::Font::plain)));
+            g.setFont(fontStd);
             g.drawText(value, r.reduced(geo.S(4), 0), juce::Justification::centredRight, false);
         };
         row(geo.pitch, "Pitch", fmtSt(param(voc::oscPitch), false));
@@ -421,16 +544,16 @@ void AbletonVocoderEditor::paint(juce::Graphics& g)
     else
     {
         g.setColour(kText);
-        g.setFont(juce::Font(juce::FontOptions("Arial", geo.fs, juce::Font::plain)));
+        g.setFont(fontStd);
         g.drawFittedText(carrier == 1 ? "Sidechain: ch 3/4" : "Carrier = modulator",
                          geo.ctx.reduced(geo.S(6)).toNearestInt(), juce::Justification::centred, 2);
     }
 
-    drawBtn(g, geo.enhance, "Enhance", enhance, geo.fs);
-    drawKnob(g, geo.uv, geo.uvR, linNorm(unvoiced, -96.f, 0.f), "Unvoiced", fmtDb(unvoiced, false), geo.s, geo.fs, geo.fm);
-    drawCaption(g, geo.sens.getX(), geo.sens.getY(), "Sens.", geo.fm);
-    drawNum(g, geo.sens, juce::String((int) std::round(sens)) + "%", geo.fs);
-    drawBtn(g, geo.speed, speed > 0 ? "Fast" : "Slow", speed > 0, geo.fs);
+    drawBtn(g, geo.enhance, "Enhance", enhance, fontStd);
+    drawKnob(g, geo.uv, geo.uvR, linNorm(unvoiced, -96.f, 0.f), "Unvoiced", fmtDb(unvoiced, false), geo.s, geo.fs, geo.fm, fontStd, fontMini);
+    drawCaption(g, geo.sens.getX(), geo.sens.getY(), "Sens.", geo.fm, fontMini);
+    drawNum(g, geo.sens, juce::String((int) std::round(sens)) + "%", fontStd);
+    drawBtn(g, geo.speed, speed > 0 ? "Fast" : "Slow", speed > 0, fontStd);
 
     g.setColour(kScreen);
     g.fillRect(geo.disp);
@@ -463,53 +586,49 @@ void AbletonVocoderEditor::paint(juce::Graphics& g)
         }
     }
 
-    drawCaption(g, geo.bands.getX(), geo.bands.getY(), "Bands", geo.fm);
-    drawDrop(g, geo.bands, juce::String(nBands), menu == 2, geo.s, geo.fs);
-    drawCaption(g, geo.rLow.getX(), geo.rLow.getY(), "Range", geo.fm);
-    drawNum(g, geo.rLow, fmtHz(param(voc::rangeLow)), geo.fs);
-    drawNum(g, geo.rHigh, fmtHz(param(voc::rangeHigh)), geo.fs);
-    drawCaption(g, geo.bw.getX(), geo.bw.getY(), "BW", geo.fm);
-    drawNum(g, geo.bw, juce::String((int) std::round(param(voc::bw))) + "%", geo.fs);
-    drawCaption(g, geo.mode.getX(), geo.mode.getY(), fmode ? "Retro" : "Precise", geo.fm);
-    drawBtn(g, geo.mode, fmode ? "Retro" : "Precise", fmode != 0, geo.fs);
-    drawCaption(g, geo.gate.getX(), geo.gate.getY(), "Gate", geo.fm);
-    drawNum(g, geo.gate, fmtDb(param(voc::gate), false), geo.fs);
-    drawCaption(g, geo.level.getX(), geo.level.getY(), "Level", geo.fm);
-    drawNum(g, geo.level, fmtDb(param(voc::level), true), geo.fs);
+    drawCaption(g, geo.bands.getX(), geo.bands.getY(), "Bands", geo.fm, fontMini);
+    drawDrop(g, geo.bands, juce::String(nBands), menu == 2, geo.s, fontStd);
+    drawCaption(g, geo.rLow.getX(), geo.rLow.getY(), "Range", geo.fm, fontMini);
+    drawNum(g, geo.rLow, fmtHz(param(voc::rangeLow)), fontStd);
+    drawNum(g, geo.rHigh, fmtHz(param(voc::rangeHigh)), fontStd);
+    drawCaption(g, geo.bw.getX(), geo.bw.getY(), "BW", geo.fm, fontMini);
+    drawNum(g, geo.bw, juce::String((int) std::round(param(voc::bw))) + "%", fontStd);
+    drawCaption(g, geo.mode.getX(), geo.mode.getY(), fmode ? "Retro" : "Precise", geo.fm, fontMini);
+    drawBtn(g, geo.mode, fmode ? "Retro" : "Precise", fmode != 0, fontStd);
+    drawCaption(g, geo.gate.getX(), geo.gate.getY(), "Gate", geo.fm, fontMini);
+    drawNum(g, geo.gate, fmtDb(param(voc::gate), false), fontStd);
+    drawCaption(g, geo.level.getX(), geo.level.getY(), "Level", geo.fm, fontMini);
+    drawNum(g, geo.level, fmtDb(param(voc::level), true), fontStd);
 
     drawKnob(g, geo.depth, geo.depthR, linNorm(depth, 0.f, 200.f), "Depth",
-             juce::String((int) std::round(depth)) + "%", geo.s, geo.fs, geo.fm);
-    drawBtn(g, geo.chMono, "Mono", channels == 0, geo.fs);
-    drawBtn(g, geo.chSt, "Stereo", channels == 1, geo.fs);
-    drawBtn(g, geo.chLR, "L/R", channels == 2, geo.fs);
-    drawKnob(g, geo.attack, geo.smallR, logNorm(attack, 0.1f, 100.f), "Attack", fmtMs(attack, false), geo.s, geo.fs, geo.fm);
-    drawKnob(g, geo.formant, geo.smallR, linNorm(formant, -12.f, 12.f), "Formant", fmtSt(formant, true), geo.s, geo.fs, geo.fm);
-    drawKnob(g, geo.release, geo.smallR, logNorm(release, 1.f, 1000.f), "Release", fmtMs(release, true), geo.s, geo.fs, geo.fm);
+             juce::String((int) std::round(depth)) + "%", geo.s, geo.fs, geo.fm, fontStd, fontMini);
+    drawBtn(g, geo.chMono, "Mono", channels == 0, fontStd);
+    drawBtn(g, geo.chSt, "Stereo", channels == 1, fontStd);
+    drawBtn(g, geo.chLR, "L/R", channels == 2, fontStd);
+    drawKnob(g, geo.attack, geo.smallR, logNorm(attack, 0.1f, 100.f), "Attack", fmtMs(attack, false), geo.s, geo.fs, geo.fm, fontStd, fontMini);
+    drawKnob(g, geo.formant, geo.smallR, linNorm(formant, -12.f, 12.f), "Formant", fmtSt(formant, true), geo.s, geo.fs, geo.fm, fontStd, fontMini);
+    drawKnob(g, geo.release, geo.smallR, logNorm(release, 1.f, 1000.f), "Release", fmtMs(release, true), geo.s, geo.fs, geo.fm, fontStd, fontMini);
     drawKnob(g, geo.dry, geo.smallR, linNorm(dry, 0.f, 100.f), "Dry/Wet",
-             juce::String((int) std::round(dry)) + "%", geo.s, geo.fs, geo.fm);
+             juce::String((int) std::round(dry)) + "%", geo.s, geo.fs, geo.fm, fontStd, fontMini);
 
     if (menu > 0)
     {
+        const auto area = getMenuRect();
         const int n = menu == 2 ? 10 : 4;
-        const float ih = geo.S(18.f);
-        juce::Rectangle<float> anchor = menu == 1 ? geo.carrier : menu == 2 ? geo.bands : geo.wave;
-        float y = menu == 2 ? anchor.getY() - n * ih : anchor.getBottom() + geo.S(2.f);
-        float x = anchor.getX();
-        float w = menu == 2 ? std::max(anchor.getWidth(), geo.S(56.f)) : anchor.getWidth();
-        if (y < 2.f) y = 2.f;
-        if (y + n * ih > (float) getHeight() - 2.f)
-            y = (float) getHeight() - 2.f - n * ih;
+        const float ih = area.getHeight() / (float) n;
+        const float x = area.getX();
+        const float y = area.getY();
+        const float w = area.getWidth();
         g.setColour(juce::Colours::black.withAlpha(0.4f));
-        g.fillRect(x + geo.S(2), y + geo.S(3), w, n * ih);
+        g.fillRect(x + geo.S(2), y + geo.S(3), w, area.getHeight());
         g.setColour(kPanel);
-        g.fillRect(x, y, w, n * ih);
+        g.fillRect(area);
         g.setColour(kTeal);
-        g.drawRect(x, y, w, n * ih, 1.f);
-        const auto mouse = getMouseXYRelative().toFloat();
+        g.drawRect(area, 1.f);
         for (int j = 0; j < n; ++j)
         {
             const auto row = juce::Rectangle<float>(x, y + (float) j * ih, w, ih);
-            const bool hov = row.contains(mouse);
+            const bool hov = (j == menuHover);
             const bool cur = (menu == 1 && carrier == j) || (menu == 2 && bandIdx == j) || (menu == 3 && wave == j);
             if (hov)
             {
@@ -524,9 +643,31 @@ void AbletonVocoderEditor::paint(juce::Graphics& g)
             }
             juce::String label = menu == 1 ? carrierName(j) : menu == 2 ? juce::String((j + 1) * 4) : waveName(j);
             g.setColour(hov ? kText : cur ? kTeal : kDim);
-            g.setFont(juce::Font(juce::FontOptions("Arial", geo.fs, juce::Font::plain)));
+            g.setFont(fontStd);
             g.drawText(label, row.reduced(geo.S(8), 0), juce::Justification::centredLeft, false);
         }
+    }
+}
+
+void AbletonVocoderEditor::mouseMove(const juce::MouseEvent& e)
+{
+    if (menu > 0)
+    {
+        const int hov = getMenuItemAt(e.position);
+        if (hov != menuHover)
+        {
+            menuHover = hov;
+            repaint();
+        }
+    }
+}
+
+void AbletonVocoderEditor::mouseExit(const juce::MouseEvent&)
+{
+    if (menu > 0 && menuHover != -1)
+    {
+        menuHover = -1;
+        repaint();
     }
 }
 
@@ -534,33 +675,22 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
 {
     const Geo geo = makeGeo((float) getWidth(), (float) getHeight());
     const auto p = e.position;
-    const bool fine = e.mods.isShiftDown();
     const bool dbl = e.getNumberOfClicks() >= 2;
-    juce::ignoreUnused(fine);
 
     if (menu > 0 && menuArmed)
     {
-        const int n = menu == 2 ? 10 : 4;
-        const float ih = geo.S(18.f);
-        juce::Rectangle<float> anchor = menu == 1 ? geo.carrier : menu == 2 ? geo.bands : geo.wave;
-        float y = menu == 2 ? anchor.getY() - n * ih : anchor.getBottom() + geo.S(2.f);
-        float x = anchor.getX();
-        float w = menu == 2 ? std::max(anchor.getWidth(), geo.S(56.f)) : anchor.getWidth();
-        if (y < 2.f) y = 2.f;
-        if (y + n * ih > (float) getHeight() - 2.f)
-            y = (float) getHeight() - 2.f - n * ih;
-        const auto area = juce::Rectangle<float>(x, y, w, n * ih);
-        if (area.contains(p))
+        const int item = getMenuItemAt(p);
+        if (item >= 0)
         {
-            int j = (int) std::floor((p.y - y) / ih);
-            j = std::clamp(j, 0, n - 1);
             const char* id = menu == 1 ? voc::carrier : menu == 2 ? voc::bands : voc::oscWave;
             beginParam(id);
-            setParam(id, (float) j);
+            setParam(id, (float) item);
             endParam(id);
         }
         menu = 0;
         menuArmed = false;
+        menuHover = -1;
+        giveAwayKeyboardFocus();
         repaint();
         return;
     }
@@ -570,6 +700,7 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
         beginParam(id);
         setParam(id, value);
         endParam(id);
+        repaint();
     };
     auto start = [&](const char* id, float lo, float hi, float step, bool log)
     {
@@ -593,6 +724,7 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
                           : id == voc::trackHigh ? 1000.f
                           : param(id));
             endParam(id);
+            repaint();
             return;
         }
         drag = Drag::value;
@@ -612,11 +744,22 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
         toggle(voc::deviceOn, param(voc::deviceOn) > 0.5f ? 0.f : 1.f);
         return;
     }
-    if (geo.carrier.contains(p)) { menu = 1; menuArmed = false; repaint(); return; }
-    if (geo.bands.contains(p)) { menu = 2; menuArmed = false; repaint(); return; }
+    auto openMenu = [&](int mId)
+    {
+        menu = mId;
+        menuArmed = false;
+        menuDownPos = p;
+        menuDownMs = juce::Time::getMillisecondCounter();
+        menuHover = getMenuItemAt(p);
+        grabKeyboardFocus();
+        repaint();
+    };
+    if (geo.carrier.contains(p)) { openMenu(1); return; }
+    if (geo.bands.contains(p)) { openMenu(2); return; }
     if ((int) std::lround(param(voc::carrier)) == 3 && geo.wave.contains(p))
     {
-        menu = 3; menuArmed = false; repaint(); return;
+        openMenu(3);
+        return;
     }
     if (geo.enhance.contains(p)) { toggle(voc::enhance, param(voc::enhance) > 0.5f ? 0.f : 1.f); return; }
     if (geo.speed.contains(p)) { toggle(voc::uvSpeed, param(voc::uvSpeed) > 0.5f ? 0.f : 1.f); return; }
@@ -644,6 +787,7 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
         {
             beginParam(voc::noiseRate); setParam(voc::noiseRate, 1.f); endParam(voc::noiseRate);
             beginParam(voc::noiseCrackle); setParam(voc::noiseCrackle, 1.f); endParam(voc::noiseCrackle);
+            repaint();
             return;
         }
         drag = Drag::xy;
@@ -669,12 +813,14 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
         {
             proc.resetAllBands();
             proc.updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged(true));
+            repaint();
             return;
         }
         if (dbl)
         {
             proc.setBandAttDb(band, 0.f);
             proc.updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged(true));
+            repaint();
             return;
         }
         const float att = quantize(-60.f * std::clamp((p.y - geo.bars.getY()) / std::max(geo.bars.getHeight(), 1.f), 0.f, 1.f), -60.f, 0.f, 0.1f);
@@ -686,12 +832,24 @@ void AbletonVocoderEditor::mouseDown(const juce::MouseEvent& e)
         {
             proc.setBandAttDb(band, att);
             bandDirty = true;
+            repaint();
         }
     }
 }
 
 void AbletonVocoderEditor::mouseDrag(const juce::MouseEvent& e)
 {
+    if (menu > 0)
+    {
+        const int hov = getMenuItemAt(e.position);
+        if (hov != menuHover)
+        {
+            menuHover = hov;
+            repaint();
+        }
+        return;
+    }
+
     const Geo geo = makeGeo((float) getWidth(), (float) getHeight());
     if (drag == Drag::value && dragId != nullptr)
     {
@@ -700,6 +858,7 @@ void AbletonVocoderEditor::mouseDrag(const juce::MouseEvent& e)
         {
             setParam(dragId, v);
             dragMoved = true;
+            repaint();
         }
         return;
     }
@@ -713,11 +872,13 @@ void AbletonVocoderEditor::mouseDrag(const juce::MouseEvent& e)
         {
             setParam(voc::noiseRate, nx);
             xyRate = true;
+            repaint();
         }
         if (std::abs(ny - param(voc::noiseCrackle)) >= 0.005f)
         {
             setParam(voc::noiseCrackle, ny);
             xyCrack = true;
+            repaint();
         }
         return;
     }
@@ -744,10 +905,12 @@ void AbletonVocoderEditor::mouseDrag(const juce::MouseEvent& e)
         }
         bandLast = band;
         bandLastAtt = att;
+        if (bandDirty)
+            repaint();
     }
 }
 
-void AbletonVocoderEditor::mouseUp(const juce::MouseEvent&)
+void AbletonVocoderEditor::mouseUp(const juce::MouseEvent& e)
 {
     if (drag == Drag::value && dragId != nullptr)
         endParam(dragId);
@@ -758,8 +921,29 @@ void AbletonVocoderEditor::mouseUp(const juce::MouseEvent&)
     }
     if (drag == Drag::band && bandDirty)
         proc.updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged(true));
-    if (menu > 0)
-        menuArmed = true;
+    if (menu > 0 && !menuArmed)
+    {
+        const int item = getMenuItemAt(e.position);
+        const float dist = e.position.getDistanceFrom(menuDownPos);
+        const uint32_t heldMs = juce::Time::getMillisecondCounter() - menuDownMs;
+        if (item >= 0 && (dist > 3.f || heldMs > 220u))
+        {
+            // Support click-hold-drag-release selection on dropdown menus
+            const char* id = menu == 1 ? voc::carrier : menu == 2 ? voc::bands : voc::oscWave;
+            beginParam(id);
+            setParam(id, (float) item);
+            endParam(id);
+            menu = 0;
+            menuArmed = false;
+            menuHover = -1;
+            giveAwayKeyboardFocus();
+            repaint();
+        }
+        else
+        {
+            menuArmed = true;
+        }
+    }
     drag = Drag::none;
     dragId = nullptr;
     bandLast = -1;
@@ -769,13 +953,14 @@ void AbletonVocoderEditor::mouseUp(const juce::MouseEvent&)
 
 void AbletonVocoderEditor::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
 {
-    if (menu > 0 || std::abs(wheel.deltaY) < 0.01f)
+    const float delta = std::abs(wheel.deltaY) > std::abs(wheel.deltaX) ? wheel.deltaY : wheel.deltaX;
+    if (menu > 0 || delta == 0.f)
         return;
     const Geo geo = makeGeo((float) getWidth(), (float) getHeight());
     const auto p = e.position;
     const bool fine = e.mods.isShiftDown();
     const char* id = nullptr;
-    float lo = 0, hi = 1, step = 0.01f, def = 0;
+    float lo = 0, hi = 1, step = 0.01f;
     bool log = false;
     auto hit = [&](bool cond, const char* pid, float a, float b, float st, bool lg)
     {
@@ -802,7 +987,6 @@ void AbletonVocoderEditor::mouseWheelMove(const juce::MouseEvent& e, const juce:
         hit(geo.low.contains(p), voc::trackLow, 20, 1000, 1, true);
         hit(geo.high.contains(p), voc::trackHigh, 100, 2000, 1, true);
     }
-    juce::ignoreUnused(def);
     if (id == nullptr && (int) std::lround(param(voc::carrier)) == 0 && geo.pad.contains(p))
     {
         id = fine ? voc::noiseRate : voc::noiseCrackle;
@@ -810,7 +994,12 @@ void AbletonVocoderEditor::mouseWheelMove(const juce::MouseEvent& e, const juce:
     }
     if (id == nullptr)
         return;
+    const float cur = param(id);
+    float next = wheelValue(cur, delta, lo, hi, step, log, fine);
+    if (std::memcmp(&next, &cur, sizeof(float)) == 0 && delta != 0.f && step > 0.f)
+        next = quantize(cur + (delta > 0.f ? step : -step), lo, hi, step);
     beginParam(id);
-    setParam(id, wheelValue(param(id), wheel.deltaY, lo, hi, step, log, fine));
+    setParam(id, next);
     endParam(id);
+    repaint();
 }

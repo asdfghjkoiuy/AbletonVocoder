@@ -67,7 +67,7 @@ DISP_ENV = 40;
 //  5 retro gain target
 //  6 flat makeup smoothed (linear, includes alternating-sum normalization)
 //  7 flat makeup target
-//  8 inv sqrt(noise power gain)   so env_rms * this ~= white-equivalent RMS
+//  8 inv sqrt(noise power gain) smoothed
 //  9 sign (+1 / -1), alternating across the bank
 // 10 attenuation smoothed (linear)
 // 11 attenuation target (linear)
@@ -75,8 +75,12 @@ DISP_ENV = 40;
 // 16 sa1 17 sa2 18 sa3 19 sk synthesis SVF
 // 20 band mix 0..1
 // 21 center Hz (analysis, smoothed)
+// 22 polarity * flatness * retro * n_trim
+// 23 inv_sqrt(vr)/REF_LIN
+// 24 inv sqrt(noise power gain) target
+// 25 initialized flag (1 once band has been active)
 COEF = 128;
-CSTR = 24;
+CSTR = 26;
 
 // Filter state. 4 lanes x MAXB. Stride 8.
 // lane 0 analysis L (also mono / stereo modulator)
@@ -181,7 +185,16 @@ P50_SCALE = 0.12589254117941673;
 P25_SCALE = 0.14536818507780461;
 P125_SCALE = 0.19033163193068273;
 
-memset(0, 0, HI + 48 * MAXB);
+// Transport play re-runs @init without @serialize. BAND_ATT lives in slots
+// 0..MAXB-1 and must survive that. REAPER only wipes the heap on a full
+// reset, which also clears named variables, so band_att_init starts at 0
+// exactly once.
+!band_att_init ? (
+  memset(BAND_ATT, 0, MAXB);
+  band_att_init = 1;
+);
+memset(DISP_ENV, 0, COEF - DISP_ENV);
+memset(COEF, 0, HI + 48 * MAXB - COEF);
 
 pt_target = 100;
 pt_log = log(100);
@@ -204,6 +217,10 @@ prev_fhi = -1;
 prev_bw = -1;
 prev_retro = -1;
 prev_srate = -1;
+prev_n_bands = -1;
+prev_decim = -1;
+prev_gate_off = 1;
+gate_settling = 0;
 car_link_ok = 1;
 syn_linked = 1;
 asleep = 0;
@@ -273,29 +290,50 @@ function h4_det(freq, fc, qq) local(g, k, w, den, num) global(srate, PI) (
   num;
 );
 
-function band_vr(fc, qq) local(g, vr, n, i, f1, f2, f, p, prev_f, prev_p, step) global(srate, PI) (
+function trap_h4(f1, f2, n, fc, qq) local(i, step, prev_f, prev_p, f, p, acc) (
+  (n < 1 || f2 <= f1) ? 0 : (
+    step = log(f2 / f1) / n;
+    prev_f = f1;
+    prev_p = h4_det(f1, fc, qq);
+    acc = 0;
+    i = 1;
+    loop(n,
+      f = f1 * exp(step * i);
+      p = h4_det(f, fc, qq);
+      acc += (prev_p + p) * 0.5 * (f - prev_f);
+      prev_f = f;
+      prev_p = p;
+      i += 1;
+    );
+    acc;
+  );
+);
+
+function band_vr(fc, qq) local(g, analytic, ratio, n, half, f1, f2, fc_split, numeric, t) global(srate, PI) (
   g = tan(PI * min(fc, srate * 0.45) / srate);
-  vr = g / (2 * qq * (1 + g * g));
-  (qq >= 1.2 && fc < srate * 0.12) ? vr : (
-    n = 72;
+  analytic = g / (2 * qq * (1 + g * g));
+  ratio = fc / srate;
+  (qq >= 1.2 && ratio <= 0.08) ? analytic : (
+    n = ceil(72 * max(1, qq / 4));
+    n < 144 ? n = 144;
+    n > 1024 ? n = 1024;
+    floor(n) % 2 ? (n < 1024 ? n += 1 : n -= 1);
+    n = floor(n);
+    half = floor(n / 2);
+    half < 1 ? half = 1;
     f1 = max(fc / 32, 1);
     f2 = min(fc * 32, srate * 0.49);
-    f2 <= f1 ? vr : (
-      step = log(f2 / f1) / (n - 1);
-      prev_f = f1;
-      prev_p = h4_det(f1, fc, qq);
-      vr = 0;
-      i = 1;
-      loop(n - 1,
-        f = f1 * exp(step * i);
-        p = h4_det(f, fc, qq);
-        vr += (prev_p + p) * 0.5 * (f - prev_f);
-        prev_f = f;
-        prev_p = p;
-        i += 1;
-      );
-      vr = 2 * vr / srate;
-      vr < 0.0000000001 ? 0.0000000001 : vr;
+    f2 <= f1 ? analytic : (
+      fc_split = fc;
+      fc_split < f1 ? fc_split = f1;
+      fc_split > f2 ? fc_split = f2;
+      numeric = 2 * (trap_h4(f1, fc_split, half, fc, qq) + trap_h4(fc_split, f2, half, fc, qq)) / srate;
+      t = (ratio - 0.08) / 0.06;
+      t < 0 ? t = 0;
+      t > 1 ? t = 1;
+      t = t * t * (3 - 2 * t);
+      (qq < 1.2 || ratio >= 0.14) ? t = 1;
+      analytic * (1 - t) + numeric * t;
     );
   );
 );
@@ -353,7 +391,9 @@ function solve_flat() local(nfreq, fmin, fmax, log0, log1, fi, bi, freq, idx, sg
   (n_bands < 2 || fmax <= fmin * 1.02) ? (
     bi = 0;
     loop(n_bands,
-      (COEF + bi * CSTR)[7] = 1;
+      cf = COEF + bi * CSTR;
+      cf[7] = 1;
+      !cf[25] ? (cf[6] = 1; cf[25] = 1;);
       bi += 1;
     );
   ) : (
@@ -437,13 +477,15 @@ function solve_flat() local(nfreq, fmin, fmax, log0, log1, fi, bi, freq, idx, sg
     med < 0.0001 ? med = 1;
     bi = 0;
     loop(n_bands,
-      (COEF + bi * CSTR)[7] = GARR[bi] / med;
+      cf = COEF + bi * CSTR;
+      cf[7] = GARR[bi] / med;
+      !cf[25] ? (cf[6] = cf[7]; cf[25] = 1;);
       bi += 1;
     );
   );
 );
 
-function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(srate, flo, fhi, n_bands, bw_pct, retro_on, COEF, CSTR, MAXB, LN2, DB2A, DENS_EXP) (
+function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(srate, flo, fhi, n_bands, bw_pct, retro_on, boot, COEF, CSTR, MAXB, LN2, DB2A, DENS_EXP) (
   flo < 20 ? flo = 20;
   fhi > srate * 0.45 ? fhi = srate * 0.45;
   fhi < flo * 1.25 ? fhi = min(flo * 1.25, srate * 0.45);
@@ -454,6 +496,7 @@ function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(
   bi = 0;
   loop(MAXB,
     cf = COEF + bi * CSTR;
+    cf[9] = (bi % 2) ? -1 : 1;
     bi < n_bands ? (
       n_bands > 1 ? t = bi / (n_bands - 1) : t = 0;
       fc = exp(log(flo) + span * (n_bands > 1 ? bi / (n_bands - 1) : 0.5));
@@ -469,26 +512,71 @@ function design_targets() local(bi, cf, t, span, fc, qq, qm, vr, bw_oct) global(
       );
       cf[1] = log(fc);
       cf[3] = qq;
-      cf[9] = (bi % 2) ? -1 : 1;
-      vr = band_vr(fc, qq);
+      vr = band_vr(fc, qq) * (srate / 48000);
       vr < 0.0000000001 ? vr = 0.0000000001;
       // DENS_EXP = 1 maps band RMS to white-equivalent level (flat on white).
       // Lower values reduce the boost on narrow bands, which is where a saw
       // or a vowel piles up. 1 is the flat-white calibration.
-      cf[8] = exp(DENS_EXP * log(1 / sqrt(vr)));
+      cf[24] = exp(DENS_EXP * log(1 / sqrt(vr)));
+      (boot || !cf[25]) ? (
+        cf[0] = cf[1];
+        cf[2] = cf[3];
+        cf[4] = cf[5];
+        cf[8] = cf[24];
+      );
       cf[21] = fc;
     ) : (
-      cf[1] = log(max(flo, 20));
-      cf[3] = 1;
-      cf[5] = 1;
-      cf[7] = 0;
-      cf[8] = 1;
-      cf[9] = 1;
-      cf[21] = flo;
+      (boot || !cf[25]) ? (
+        cf[0] = cf[1] = log(max(flo, 20));
+        cf[2] = cf[3] = 1;
+        cf[4] = cf[5] = 1;
+        cf[6] = cf[7] = 0;
+        cf[8] = cf[24] = 1;
+        cf[21] = flo;
+      );
     );
     bi += 1;
   );
   solve_flat();
+);
+
+function clear_band_state(bi) local(c, st) global(STATE, SSTR, LANE_STEP) (
+  c = 0;
+  loop(4,
+    st = STATE + bi * SSTR + c * LANE_STEP;
+    st[0] = 0;
+    st[1] = 0;
+    st[2] = 0;
+    st[3] = 0;
+    st[4] = 0;
+    st[5] = 1;
+    st[6] = 1;
+    st[7] = 0;
+    c += 1;
+  );
+);
+
+// Inactive bands leave n_run once mix falls through 0.001, which freezes
+// env and SVF state. Snap that tail to silence, and do the same when a
+// band is switched back on before the tail had reached zero.
+function retire_bands() local(bi, cf, m, active) global(COEF, CSTR, MAXB, n_bands, prev_n_bands) (
+  bi = 0;
+  loop(MAXB,
+    cf = COEF + bi * CSTR;
+    m = cf[20];
+    active = bi < n_bands;
+    (active && prev_n_bands >= 0 && bi >= prev_n_bands && m <= 0.001) ? (
+      clear_band_state(bi);
+      cf[20] = 0;
+    ) : (
+      (!active && m <= 0.001) ? (
+        clear_band_state(bi);
+        cf[20] = 0;
+      );
+    );
+    bi += 1;
+  );
+  prev_n_bands = n_bands;
 );
 
 function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio, d, busy) global(o_a1, o_a2, o_a3, o_k, srate, samplesblock, boot, formant_sm, s_formant, LN2, COEF, CSTR, MAXB, n_bands, coef_busy) (
@@ -509,6 +597,7 @@ function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio, d, busy
       cf[2] = cf[3];
       cf[4] = cf[5];
       cf[6] = cf[7];
+      cf[8] = cf[24];
       amix = bi < n_bands ? 1 : 0;
       cf[20] = amix;
     ) : (
@@ -520,6 +609,8 @@ function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio, d, busy
       abs(d) < 0.00001 ? cf[4] = cf[5] : (cf[4] += a * d; busy = 1);
       d = cf[7] - cf[6];
       abs(d) < 0.00001 ? cf[6] = cf[7] : (cf[6] += a * d; busy = 1);
+      d = cf[24] - cf[8];
+      abs(d) < 0.00001 ? cf[8] = cf[24] : (cf[8] += a * d; busy = 1);
     );
     fc = exp(cf[0]);
     qq = cf[2];
@@ -535,6 +626,7 @@ function smooth_coeffs() local(bi, cf, a, fc, fcs, qq, amix, form_ratio, d, busy
     cf[21] = fc;
     bi += 1;
   );
+  retire_bands();
   coef_busy = busy;
 );
 
@@ -588,10 +680,9 @@ function gate_follow(st, env) local(op, gg) global(gate_off, gate_open_th, gate_
   );
 );
 
-function depth_gain(env, inv_vr) local(go, gn, b) global(depth_mode, INV_REF_DENS, INV_REF_ENH, depth_k, GAIN_CAP, enh_mix) (
-  depth_mode == 0 ? (
-    go = 1;
-    gn = 1;
+function depth_gain(env, inv_vr) local(go, gn, b, g, w) global(depth_mode, INV_REF_DENS, INV_REF_ENH, depth_k, depth_blend, GAIN_CAP, enh_mix) (
+  depth_mode == 0 && depth_blend <= 0 ? (
+    1;
   ) : (
     env < 0.000000000001 ? (
       go = 0;
@@ -602,12 +693,17 @@ function depth_gain(env, inv_vr) local(go, gn, b) global(depth_mode, INV_REF_DEN
       b = env * INV_REF_ENH;
       gn = exp(depth_k * log(b));
     );
+    go > GAIN_CAP ? go = GAIN_CAP;
+    gn > GAIN_CAP ? gn = GAIN_CAP;
+    go < 0 ? go = 0;
+    gn < 0 ? gn = 0;
+    g = go * (1 - enh_mix) + gn * enh_mix;
+    depth_blend < 1 ? (
+      w = max(0, min(1, depth_blend));
+      g = (1 - w) + w * g;
+    );
+    g;
   );
-  go > GAIN_CAP ? go = GAIN_CAP;
-  gn > GAIN_CAP ? gn = GAIN_CAP;
-  go < 0 ? go = 0;
-  gn < 0 ? gn = 0;
-  go * (1 - enh_mix) + gn * enh_mix;
 );
 
 // 12 dB log-domain smoothstep, without log(). enh_flo / enh_hi / enh_span are
@@ -867,18 +963,20 @@ global(COEF, CSTR, STATE, SSTR, LANE_STEP, n_bands, att_2, rel_2, env_ph, GAIN_C
   sumR = sumL;
 );
 
-// Drop a lane that is about to start from a frozen state (analysis R when
-// entering L/R). Gate open/gain are left alone so a closed gate stays closed.
-function zero_lane(base) local(bi, st) global(SSTR, MAXB) (
+// Copy live left analysis state into the right analysis lane when entering L/R.
+function copy_analysis_lr() local(bi, stA, stB) global(STATE, SSTR, LANE_STEP, MAXB) (
   bi = 0;
   loop(MAXB,
-    st = base + bi * SSTR;
-    st[0] = 0;
-    st[1] = 0;
-    st[2] = 0;
-    st[3] = 0;
-    st[4] = 0;
-    st[7] = 0;
+    stA = STATE + bi * SSTR;
+    stB = stA + LANE_STEP;
+    stB[0] = stA[0];
+    stB[1] = stA[1];
+    stB[2] = stA[2];
+    stB[3] = stA[3];
+    stB[4] = stA[4];
+    stB[5] = stA[5];
+    stB[6] = stA[6];
+    stB[7] = stA[7];
     bi += 1;
   );
 );
@@ -964,6 +1062,8 @@ boot ? (
   wet = max(0, min(1, s_drywet * 0.01));
   dev = s_device > 0.5;
   enh_mix = s_enhance > 0.5;
+  depth_sm = s_depth;
+  depth_blend = s_depth < 20 ? max(0, min(1, s_depth * 0.05)) : 1;
   formant_sm = s_formant;
   active_carrier = tgt_carrier;
   active_ch = tgt_ch;
@@ -1018,7 +1118,7 @@ att_sm_c = 1 - exp(-1 / (0.008 * srate));
 // Release is shorter than the attack, and short enough that a fricative
 // does not leave noise in the next 20 ms frame once the modulator HF is gone.
 uv_ms_a = s_uvspeed > 0.5 ? 0.004 : 0.012;
-uv_ms_r = s_uvspeed > 0.5 ? 0.0025 : 0.0015;
+uv_ms_r = s_uvspeed > 0.5 ? 0.0015 : 0.0025;
 uv_att = 1 - exp(-1 / (uv_ms_a * srate));
 uv_rel = 1 - exp(-1 / (uv_ms_r * srate));
 glide_c = 1 - exp(-1 / (0.0025 * srate));
@@ -1029,20 +1129,36 @@ wet_target = max(0, min(1, s_drywet * 0.01));
 dev_target = s_device > 0.5;
 enh_target = s_enhance > 0.5;
 
-depth_sm = s_depth;
-abs(s_depth - 100) < 0.01 ? depth_mode = 1 : (
-  s_depth < 0.01 ? depth_mode = 0 : (
+depth_sm += (1 - exp(-samplesblock / (0.012 * srate))) * (s_depth - depth_sm);
+abs(s_depth - depth_sm) < 0.005 ? depth_sm = s_depth;
+abs(depth_sm - 100) < 0.01 ? depth_mode = 1 : (
+  depth_sm < 0.01 ? depth_mode = 0 : (
     depth_mode = 2;
-    depth_k = s_depth * 0.01;
+    depth_k = depth_sm * 0.01;
   );
+);
+blend_tgt = depth_sm < 20 ? max(0, min(1, depth_sm * 0.05)) : 1;
+depth_blend += (1 - exp(-samplesblock / (0.018 * srate))) * (blend_tgt - depth_blend);
+abs(blend_tgt - depth_blend) < 0.0005 ? depth_blend = blend_tgt;
+depth_blend > 0 && depth_mode == 0 ? (
+  depth_mode = 2;
+  depth_k = max(depth_sm * 0.01, 0.0001);
+);
+(s_depth < 20 || depth_blend < 1 || depth_mode == 0) ? (
+  asleep = 0;
+  sil_hold = 0;
 );
 
 gate_off = s_gate <= -95.5;
+!gate_off ? gate_settling = 1 : (
+  !prev_gate_off ? gate_settling = 1;
+);
+prev_gate_off = gate_off;
 gate_open_th = exp(max(s_gate, -96) * DB2A);
 gate_close_th = exp((max(s_gate, -96) - 3) * DB2A);
 
 uv_off = (s_unvoiced <= -95.5 || s_sens <= 0);
-uv_lin = uv_off ? 0 : exp(s_unvoiced * DB2A);
+uv_lin = s_unvoiced <= -95.5 ? 0 : exp(s_unvoiced * DB2A);
 uv_thr = (100 - max(0, min(100, s_sens))) * 0.0084;
 uv_energy_lin = exp(-46 * DB2A);
 
@@ -1068,6 +1184,14 @@ thigh_hz = max(tlow_hz + 10, min(s_thigh, 2000));
 yin_ceil = thigh_hz <= 1200 ? 6000 : 8000;
 decim = 2;
 while ((srate / decim) > yin_ceil) (decim += 1;);
+decim != prev_decim ? (
+  ring_w = 0;
+  ring_fill = 0;
+  hop_count = 0;
+  dec_i = 0;
+  memset(RING, 0, RING_SIZE);
+  prev_decim = decim;
+);
 sr_dec = srate / decim;
 lp_fc = min(4200, 0.40 * sr_dec);
 lp_fc != lp_fc_set ? (
@@ -1081,6 +1205,7 @@ yin_gate2 = exp(-50 * DB2A);
 yin_gate2 *= yin_gate2;
 pt_transpose = exp(max(-24, min(24, s_opitch)) * LN2 / 12);
 
+retire_bands();
 n_run = n_bands;
 bi = n_bands;
 while (bi < MAXB && (COEF + bi * CSTR)[20] > 0.001) (bi += 1;);
@@ -1108,7 +1233,7 @@ duck < 0 ? duck = 0;
 duck > 1 ? duck = 1;
 // Swap the route on this sample, while the wet sum is still ducked.
 duck < 0.02 && (active_carrier != tgt_carrier || active_ch != tgt_ch) ? (
-  active_ch != 2 && tgt_ch == 2 ? zero_lane(STATE + LANE_STEP);
+  active_ch != 2 && tgt_ch == 2 ? copy_analysis_lr();
   active_carrier = tgt_carrier;
   active_ch = tgt_ch;
   duck_target = 1;
@@ -1116,13 +1241,36 @@ duck < 0.02 && (active_carrier != tgt_carrier || active_ch != tgt_ch) ? (
   syn_linked = 1;
 );
 
+spl0 != spl0 || abs(spl0) > 100000000 ? spl0 = 0;
+spl1 != spl1 || abs(spl1) > 100000000 ? spl1 = 0;
+spl2 != spl2 || abs(spl2) > 100000000 ? spl2 = 0;
+spl3 != spl3 || abs(spl3) > 100000000 ? spl3 = 0;
 inL = spl0;
 inR = spl1;
 quiet_in = abs(inL) < 0.0000001 && abs(inR) < 0.0000001;
-asleep && quiet_in ? (
+dev_target == 0 && dev < 0.00001 ? (
+  dev = 0;
+  !dev_cleared ? (
+    memset(STATE, 0, MAXB * 4 * SSTR);
+    gi = 0;
+    loop(MAXB * 4,
+      (STATE + gi * SSTR)[5] = 1;
+      (STATE + gi * SSTR)[6] = 1;
+      gi += 1;
+    );
+    memset(DISP_ENV, 0, MAXB);
+    enh_peak = 0;
+    uv_env = 0;
+    dev_cleared = 1;
+  );
+  spl0 = inL;
+  spl1 = inR;
+) : asleep && quiet_in && depth_mode != 0 && s_depth >= 20 && depth_blend >= 1 ? (
+  dev_cleared = 0;
   spl0 = 0;
   spl1 = 0;
 ) : (
+dev_cleared = 0;
 asleep = 0;
 env_ph = 1 - env_ph;
 
@@ -1197,9 +1345,7 @@ active_ch == 0 ? (
 // Unvoiced noise is added to the carrier, then shaped by the synthesis bank
 // and the modulator envelopes. Sens 0 and Unvoiced -96 stay exactly off.
 uv_amp = 0;
-uv_off ? (
-  uv_env = 0;
-) : (
+!uv_off || uv_env > 0.000001 ? (
   // 0 dB on the Unvoiced slider. A little above the -18 dBFS carrier,
   // so fricatives read as noise and vowels do not.
   uv_amp = uv_env * uv_lin * 0.18;
@@ -1213,9 +1359,9 @@ sumL = 0;
 sumR = 0;
 e_all = 0;
 e_hi = 0;
-unity_dg = depth_mode < 0.5;
-fast_enh = depth_mode > 0.5 && depth_mode < 1.5 && enh_mix > 0.999;
-fast_dry = depth_mode > 0.5 && depth_mode < 1.5 && enh_mix < 0.001;
+unity_dg = depth_mode < 0.5 && depth_blend <= 0;
+fast_enh = depth_mode > 0.5 && depth_mode < 1.5 && depth_blend >= 1 && enh_mix > 0.999;
+fast_dry = depth_mode > 0.5 && depth_mode < 1.5 && depth_blend >= 1 && enh_mix < 0.001;
 do_enh = enh_mix > 0.0005;
 ch_mono = (active_ch == 0);
 ch_lr = (active_ch == 2);
@@ -1225,13 +1371,13 @@ ch_lr = (active_ch == 2);
 // while both pins have matched since the last route change: the first
 // difference latches stereo, so a zero or a crackle impulse cannot flip
 // the right-hand state between "copy" and "filter" every sample.
-route_mono = ch_mono || (active_carrier == 3 && uv_off);
+route_mono = ch_mono || (active_carrier == 3 && uv_off && uv_env <= 0.000001);
 active_carrier == 0 ? (
   car_link_ok = 0;
 ) : (
-  uv_off && active_carrier != 3 && car_link_ok && carL != carR ? car_link_ok = 0;
+  (uv_off && uv_env <= 0.000001) && active_carrier != 3 && car_link_ok && carL != carR ? car_link_ok = 0;
 );
-car_is_mono = route_mono || (uv_off && car_link_ok && active_carrier > 0 && active_carrier < 3);
+car_is_mono = route_mono || ((uv_off && uv_env <= 0.000001) && car_link_ok && active_carrier > 0 && active_carrier < 3);
 want_link = car_is_mono && !ch_lr;
 syn_linked && !want_link ? (
   copy_synth_lr();
@@ -1246,7 +1392,16 @@ enh_span < 0.000000000001 ? enh_span = 0.000000000001;
 enh_full = enh_mix > 0.999;
 enh_keep = 1 - enh_mix;
 bi = 0;
-fast_share = fast_dry && gate_off && !ch_lr && !do_enh && want_link && n_run == n_bands;
+gate_off && gate_settling ? (
+  gate_settling = 0;
+  gi = 0;
+  loop(n_bands,
+    gst = STATE + gi * SSTR;
+    abs(gst[6] - gst[5]) > 0.0001 ? gate_settling = 1;
+    gi += 1;
+  );
+);
+fast_share = fast_dry && gate_off && !gate_settling && !ch_lr && !do_enh && want_link && n_run == n_bands;
 fast_share ? (
   fast_bands();
   enh_peak += enh_pk_rel * (0 - enh_peak);
@@ -1377,8 +1532,8 @@ loop(n_run,
       stB[5] = p_gg;
     );
     gRgate = p_gg;
-    e_all += instL + instR;
-    fc_hz >= 4000 ? e_hi += instL + instR;
+    e_all += 0.5 * (instL + instR);
+    fc_hz >= 4000 ? e_hi += 0.5 * (instL + instR);
     disp = envL > envR ? envL : envR;
   ) : (
     envR = envL;
@@ -1511,7 +1666,10 @@ loop(MAXB - n_run,
 // plus an energy gate so silence is not fricative. Sens 100 forces the noise
 // on whenever the modulator is above the energy gate.
 uv_off ? (
-  uv_env = 0;
+  uv_env > 0.000001 ? (
+    uv_env += uv_rel * (0 - uv_env);
+    uv_env < 0.000001 ? uv_env = 0;
+  ) : uv_env = 0;
 ) : (
   e_all > 0.0000000000000001 ? (
     total_rms = sqrt(e_all);
@@ -1550,6 +1708,9 @@ unity_dg ? (
 );
 unity_dg ? 0 : (
   p_b = enh_mix + (1 - enh_mix) * p_b;
+  depth_blend < 1 ? (
+    p_b = 1 + max(0, min(1, depth_blend)) * (p_b - 1);
+  );
 );
 sumL *= p_b;
 ch_mono ? 0 : sumR *= p_b;
@@ -1563,14 +1724,29 @@ active_ch == 0 ? (
   dryR = inR;
 );
 
-// dev crossfades the whole processed mix with bypass. duck only scales the
-// vocoder sum, so a route change goes quiet instead of falling back to dry.
+// Self-heal filter states if NaN/Inf occurred inside the filter bank.
+(sumL != sumL || sumR != sumR || abs(sumL) > 100000000 || abs(sumR) > 100000000) ? (
+  sumL = 0;
+  sumR = 0;
+  memset(STATE, 0, MAXB * 4 * SSTR);
+  gi = 0;
+  loop(MAXB * 4,
+    (STATE + gi * SSTR)[5] = 1;
+    (STATE + gi * SSTR)[6] = 1;
+    gi += 1;
+  );
+  enh_peak = 0;
+  uv_env = 0;
+);
+
+// dev crossfades the whole processed mix with true stereo bypass. duck only scales
+// the vocoder sum, so a route change goes quiet instead of falling back to dry.
 sumL *= duck;
 sumR *= duck;
 procL = (dryL * (1 - wet) + sumL * wet) * lvl;
 procR = (dryR * (1 - wet) + sumR * wet) * lvl;
-spl0 = procL * dev + dryL * (1 - dev);
-spl1 = procR * dev + dryR * (1 - dev);
+spl0 = procL * dev + inL * (1 - dev);
+spl1 = procR * dev + inR * (1 - dev);
 
 spl0 != spl0 ? spl0 = 0;
 spl1 != spl1 ? spl1 = 0;
@@ -1610,7 +1786,7 @@ active_carrier == 3 ? (
   );
 );
 
-quiet_in && abs(spl0) < 0.0000001 && abs(spl1) < 0.0000001 ? (
+quiet_in && depth_mode != 0 && s_depth >= 20 && depth_blend >= 1 && abs(spl0) < 0.0000001 && abs(spl1) < 0.0000001 ? (
   sil_hold += 1;
   sil_hold > sil_need ? (
     asleep = 1;
@@ -1746,20 +1922,31 @@ function gui_set(idx, val) (
   gui_end(idx);
   param_dirty = 1;
 );
-function gui_drag_lin(idx, lo, hi, step) local(dy, old, nv) (
+function gui_drag_lin(idx, lo, hi, step) local(dy, d, nv) global(gui_drag_val, gui_s, gui_shift) (
   dy = gui_prev_y - mouse_y;
   abs(dy) > 0.01 ? (
-    old = slider(idx);
-    nv = gui_lin_set(old, lo, hi, step, dy);
-    abs(nv - old) > step * 0.25 ? gui_push(idx, nv);
+    d = dy / (160 * gui_s) * (hi - lo);
+    gui_shift ? d *= 0.1;
+    gui_drag_val += d;
+    gui_drag_val < lo ? gui_drag_val = lo;
+    gui_drag_val > hi ? gui_drag_val = hi;
+    nv = gui_q(gui_drag_val, lo, hi, step);
+    nv != slider(idx) ? gui_push(idx, nv);
   );
 );
-function gui_drag_log(idx, lo, hi, step) local(dy, old, nv) (
+function gui_drag_log(idx, lo, hi, step) local(dy, d, n, nv) global(gui_drag_val, gui_s, gui_shift) (
   dy = gui_prev_y - mouse_y;
   abs(dy) > 0.01 ? (
-    old = slider(idx);
-    nv = gui_log_set(old, lo, hi, step, dy);
-    abs(nv - old) > step * 0.25 ? gui_push(idx, nv);
+    gui_drag_val < lo ? gui_drag_val = lo;
+    n = log(gui_drag_val / lo) / log(hi / lo);
+    d = dy / (160 * gui_s);
+    gui_shift ? d *= 0.1;
+    n += d;
+    n < 0 ? n = 0;
+    n > 1 ? n = 1;
+    gui_drag_val = lo * exp(n * log(hi / lo));
+    nv = gui_q(gui_drag_val, lo, hi, step);
+    nv != slider(idx) ? gui_push(idx, nv);
   );
 );
 function gui_wheel_lin(idx, lo, hi, step) local(old, nv) (
@@ -1785,6 +1972,7 @@ function gui_ctrl(id, idx, x, y, w, h, lo, hi, step, dflt, islog, knob) local(hi
     ) : (
       gui_drag = id;
       gui_drag_idx = idx;
+      gui_drag_val = slider(idx);
       gui_moved = 0;
     );
     gui_hit_id = id;

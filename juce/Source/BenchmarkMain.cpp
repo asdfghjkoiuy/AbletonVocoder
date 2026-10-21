@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -134,14 +135,16 @@ std::vector<float> loadWav(const std::string& path)
 
 std::vector<float> loadOrSynth(const std::string& file, int n, bool saw)
 {
-    const std::string root = "/Users/guanhao/Projects/REaper/AbletonVocoder/tests/signals/";
-    auto data = loadWav(root + file);
-    if ((int) data.size() >= n)
+    for (const char* prefix : { "tests/signals/", "../tests/signals/", "../../tests/signals/" })
     {
-        data.resize((size_t) n);
-        return data;
+        auto data = loadWav(std::string(prefix) + file);
+        if ((int) data.size() >= n)
+        {
+            data.resize((size_t) n);
+            return data;
+        }
     }
-    data.assign((size_t) n, 0.f);
+    std::vector<float> data((size_t) n, 0.f);
     for (int i = 0; i < n; ++i)
     {
         const float t = (float) i / 48000.f;
@@ -202,7 +205,7 @@ Stats render(AbletonVocoderProcessor& proc, const std::vector<float>& mod, const
     juce::AudioBuffer<float> buffer(4, kBlock);
     juce::MidiBuffer midi;
     std::vector<float> out;
-    out.reserve((size_t) n);
+    out.reserve((size_t) n * 2u);
 
     buffer.clear();
     proc.processBlock(buffer, midi);
@@ -414,13 +417,227 @@ int main()
         for (int s = 0; s < 256; ++s)
             rightOut.push_back(buf.getSample(1, s));
     }
-    std::vector<float> leftHold;
-    // Re-run is unnecessary: left channel of the same pass was not stored.
-    // Measure the right channel only. A copied integrator bank rings well above 1e-3.
     const int ring0 = glitchAt + 96;
     const int ring1 = glitchAt + 96 + (int) (0.03 * 48000);
     const double rightRms = rmsOf(rightOut.data() + ring0, ring1 - ring0);
     const bool statesHeld = rightRms < 1.0e-3;
+
+    // Test 5: NaN / Inf injection & recovery test
+    uint32_t nanBits = 0x7fc00001u;
+    float nanVal = 0.f;
+    std::memcpy(&nanVal, &nanBits, 4);
+    const bool sanityCheckWorks = nonFinite(nanVal);
+
+    AbletonVocoderProcessor nanProc;
+    setParam(nanProc, voc::carrier, 1.f);
+    setParam(nanProc, voc::bands, 9.f);
+    setParam(nanProc, voc::channels, 2.f);
+    setParam(nanProc, voc::enhance, 1.f);
+    setParam(nanProc, voc::unvoiced, 0.f);
+    prepare(nanProc);
+    bool nanCleanOutput = true;
+    std::vector<float> postNanOut;
+    for (int blk = 0; blk < 60; ++blk)
+    {
+        buf.setSize(4, 256, false, false, true);
+        for (int s = 0; s < 256; ++s)
+        {
+            const int idx = (blk * 256 + s) % kN;
+            buf.setSample(0, s, speech[(size_t) idx]);
+            buf.setSample(1, s, speech[(size_t) idx]);
+            buf.setSample(2, s, chord[(size_t) idx]);
+            buf.setSample(3, s, chord[(size_t) idx]);
+        }
+        if (blk == 10)
+        {
+            buf.setSample(0, 17, nanVal);
+            buf.setSample(2, 42, -nanVal);
+            nanProc.debugInjectCorruptState(nanVal);
+        }
+        nanProc.processBlock(buf, midi);
+        for (int s = 0; s < 256; ++s)
+        {
+            const float oL = buf.getSample(0, s);
+            const float oR = buf.getSample(1, s);
+            if (nonFinite(oL) || nonFinite(oR))
+                nanCleanOutput = false;
+            if (blk >= 20)
+                postNanOut.push_back(oL);
+        }
+    }
+    const double postNanRms = rmsOf(postNanOut.data(), (int) postNanOut.size());
+    const bool nanRecovered = sanityCheckWorks && nanCleanOutput && postNanRms > 1.0e-3;
+
+    // Test 6: Wake from sleep when Depth -> 0% on Noise carrier
+    setParam(silenceProc, voc::carrier, 0.f);
+    setParam(silenceProc, voc::depth, 100.f);
+    for (int i = 0; i < 6400; i += 256)
+    {
+        buf.clear();
+        silenceProc.processBlock(buf, midi);
+    }
+    setParam(silenceProc, voc::depth, 0.f);
+    std::vector<float> wakeOut;
+    for (int i = 0; i < 16384; i += 256)
+    {
+        buf.clear();
+        silenceProc.processBlock(buf, midi);
+        if (i >= 10240)
+            for (int s = 0; s < 256; ++s)
+                wakeOut.push_back(buf.getSample(0, s));
+    }
+    const double wakeRms = rmsOf(wakeOut.data(), (int) wakeOut.size());
+    setParam(silenceProc, voc::depth, 100.f);
+    for (int i = 0; i < 16384; i += 256)
+    {
+        buf.clear();
+        silenceProc.processBlock(buf, midi);
+    }
+    setParam(silenceProc, voc::depth, 10.f);
+    std::vector<float> wake10Out;
+    for (int i = 0; i < 16384; i += 256)
+    {
+        buf.clear();
+        silenceProc.processBlock(buf, midi);
+        if (i >= 10240)
+            for (int s = 0; s < 256; ++s)
+                wake10Out.push_back(buf.getSample(0, s));
+    }
+    const double wake10Rms = rmsOf(wake10Out.data(), (int) wake10Out.size());
+    const bool wakePass = wakeRms > 0.05 && wake10Rms > 0.02;
+
+    // Test 7: Device Off -> On clears stale envelope tail
+    AbletonVocoderProcessor devProc;
+    setParam(devProc, voc::carrier, 0.f);
+    setParam(devProc, voc::release, 800.f);
+    setParam(devProc, voc::deviceOn, 1.f);
+    prepare(devProc);
+    for (int blk = 0; blk < 15; ++blk)
+    {
+        buf.setSize(4, 256, false, false, true);
+        for (int s = 0; s < 256; ++s)
+        {
+            buf.setSample(0, s, speech[(size_t) (blk * 256 + s)]);
+            buf.setSample(1, s, speech[(size_t) (blk * 256 + s)]);
+            buf.setSample(2, s, 0.f);
+            buf.setSample(3, s, 0.f);
+        }
+        devProc.processBlock(buf, midi);
+    }
+    setParam(devProc, voc::deviceOn, 0.f);
+    for (int blk = 0; blk < 30; ++blk)
+    {
+        buf.clear();
+        devProc.processBlock(buf, midi);
+    }
+    setParam(devProc, voc::deviceOn, 1.f);
+    std::vector<float> reenableOut;
+    for (int blk = 0; blk < 15; ++blk)
+    {
+        buf.clear();
+        devProc.processBlock(buf, midi);
+        for (int s = 0; s < 256; ++s)
+            reenableOut.push_back(buf.getSample(0, s));
+    }
+    const double reenableRms = rmsOf(reenableOut.data(), (int) reenableOut.size());
+    const bool devTailCleared = reenableRms < 1.0e-5;
+
+    // Test 8: Smooth Depth 100% -> 0% transition (no step jump at 0% boundary)
+    AbletonVocoderProcessor depthSweepProc;
+    setParam(depthSweepProc, voc::carrier, 1.f);
+    setParam(depthSweepProc, voc::bands, 4.f);
+    setParam(depthSweepProc, voc::depth, 100.f);
+    setParam(depthSweepProc, voc::dryWet, 100.f);
+    prepare(depthSweepProc);
+    double prevBlkPeak = 0.0;
+    double maxBlkJump = 0.0;
+    for (int blk = 0; blk < 40; ++blk)
+    {
+        if (blk == 5)
+            setParam(depthSweepProc, voc::depth, 0.f);
+        buf.setSize(4, 256, false, false, true);
+        for (int s = 0; s < 256; ++s)
+        {
+            const float c = 0.25f * std::sin((float) (2.0 * 3.14159265358979323846 * 440.0 * (blk * 256 + s) / 48000.0));
+            buf.setSample(0, s, 0.f);
+            buf.setSample(1, s, 0.f);
+            buf.setSample(2, s, c);
+            buf.setSample(3, s, c);
+        }
+        depthSweepProc.processBlock(buf, midi);
+        double blkPeak = 0.0;
+        for (int s = 0; s < 256; ++s)
+            blkPeak = std::max(blkPeak, (double) std::abs(buf.getSample(0, s)));
+        if (blk >= 6)
+            maxBlkJump = std::max(maxBlkJump, std::abs(blkPeak - prevBlkPeak));
+        prevBlkPeak = blkPeak;
+    }
+    const bool depthSweepSmooth = maxBlkJump < 0.04 && prevBlkPeak > 0.15;
+
+    // Test 9: H1 (no frozen envelope resurrection on Bands 40 -> 4 -> silence -> 40) & M2 (reset() clears tail and stays active)
+    AbletonVocoderProcessor bandSwitchProc;
+    setParam(bandSwitchProc, voc::carrier, 0.f);
+    setParam(bandSwitchProc, voc::bands, 9.f); // 40 bands
+    setParam(bandSwitchProc, voc::release, 1000.f);
+    prepare(bandSwitchProc);
+    for (int blk = 0; blk < 20; ++blk)
+    {
+        buf.setSize(4, 256, false, false, true);
+        for (int s = 0; s < 256; ++s)
+        {
+            const int idx = (blk * 256 + s) % kN;
+            buf.setSample(0, s, speech[(size_t) idx]);
+            buf.setSample(1, s, speech[(size_t) idx]);
+            buf.setSample(2, s, 0.f);
+            buf.setSample(3, s, 0.f);
+        }
+        bandSwitchProc.processBlock(buf, midi);
+    }
+    setParam(bandSwitchProc, voc::bands, 0.f); // 4 bands
+    double preSwitchPeak = 0.0;
+    for (int blk = 0; blk < 60; ++blk)
+    {
+        buf.clear();
+        bandSwitchProc.processBlock(buf, midi);
+        if (blk == 59)
+            for (int s = 0; s < 256; ++s)
+                preSwitchPeak = std::max(preSwitchPeak, (double) std::abs(buf.getSample(0, s)));
+    }
+    setParam(bandSwitchProc, voc::bands, 9.f); // back to 40 bands while silent
+    double frozenBandPeak = 0.0;
+    for (int blk = 0; blk < 20; ++blk)
+    {
+        buf.clear();
+        bandSwitchProc.processBlock(buf, midi);
+        for (int s = 0; s < 256; ++s)
+            frozenBandPeak = std::max(frozenBandPeak, (double) std::abs(buf.getSample(0, s)));
+    }
+    // Now excite again, call reset(), verify silence on silent block and normal output on active block
+    for (int blk = 0; blk < 10; ++blk)
+    {
+        for (int s = 0; s < 256; ++s)
+        {
+            buf.setSample(0, s, speech[(size_t) (4096 + blk * 256 + s)]);
+            buf.setSample(1, s, speech[(size_t) (4096 + blk * 256 + s)]);
+        }
+        bandSwitchProc.processBlock(buf, midi);
+    }
+    bandSwitchProc.reset();
+    buf.clear();
+    bandSwitchProc.processBlock(buf, midi);
+    const double resetSilRms = rmsOf(buf.getReadPointer(0), 256);
+    for (int blk = 0; blk < 4; ++blk)
+    {
+        for (int s = 0; s < 256; ++s)
+        {
+            buf.setSample(0, s, speech[(size_t) (4096 + blk * 256 + s)]);
+            buf.setSample(1, s, speech[(size_t) (4096 + blk * 256 + s)]);
+        }
+        bandSwitchProc.processBlock(buf, midi);
+    }
+    const double postResetRms = rmsOf(buf.getReadPointer(0), 256);
+    const bool bandAndResetPass = frozenBandPeak < 5.0e-4
+                               && resetSilRms < 1.0e-6 && postResetRms > 1.0e-3;
 
     std::cout << "silence-in -> silence-out  peak " << silencePeak
               << "  finite " << (silenceFinite ? "yes" : "NO")
@@ -432,9 +649,25 @@ int main()
               << "  pass " << (noDryBleed ? "yes" : "NO") << "\n";
     std::cout << "stereo state held across equal sample  right-rms " << rightRms
               << "  pass " << (statesHeld ? "yes" : "NO") << "\n";
-    juce::ignoreUnused(leftHold);
+    std::cout << "nan injection & recovery  detector " << (sanityCheckWorks ? "ok" : "BROKEN")
+              << "  clean " << (nanCleanOutput ? "yes" : "NO")
+              << "  post-rms " << postNanRms
+              << "  pass " << (nanRecovered ? "yes" : "NO") << "\n";
+    std::cout << "wake on depth=0/10 & device-off clear  wake-rms " << wakeRms
+              << "  wake10-rms " << wake10Rms
+              << "  reenable-rms " << reenableRms
+              << "  pass " << (wakePass && devTailCleared ? "yes" : "NO") << "\n";
+    std::cout << "depth 100->0 smooth transition  max-blk-jump " << maxBlkJump
+              << "  final-peak " << prevBlkPeak
+              << "  pass " << (depthSweepSmooth ? "yes" : "NO") << "\n";
+    std::cout << "frozen band clear & reset()  frozen-peak " << frozenBandPeak
+              << "  reset-sil " << resetSilRms
+              << "  post-reset " << postResetRms
+              << "  pass " << (bandAndResetPass ? "yes" : "NO") << "\n";
 
-    const bool ok = a.second && b.second && silenceFinite && silencePeak < 1.0e-5f && noDryBleed && statesHeld;
+    const bool ok = a.second && b.second && silenceFinite && silencePeak < 1.0e-5f
+                 && noDryBleed && statesHeld && nanRecovered && wakePass && devTailCleared
+                 && depthSweepSmooth && bandAndResetPass;
     std::cout << (ok ? "VERIFICATION PASS\n" : "VERIFICATION FAIL\n");
     return ok ? 0 : 1;
 }

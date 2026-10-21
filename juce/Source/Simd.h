@@ -8,6 +8,9 @@
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define VOC_NEON 1
 #include <arm_neon.h>
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define VOC_SSE2 1
+#include <immintrin.h>
 #endif
 
 #if defined(__GNUC__)
@@ -82,9 +85,9 @@ struct Mask
 
 struct V4
 {
-    float32x4_t v;
+    float32x4_t v = vdupq_n_f32(0.f);
 
-    V4() = default;
+    V4() noexcept = default;
     explicit V4(float32x4_t x) noexcept : v(x) {}
 
     static V4 splat(float x) noexcept { return V4(vdupq_n_f32(x)); }
@@ -101,6 +104,14 @@ struct V4
 
     float hsum() const noexcept { return vaddvq_f32(v); }
     float hmax() const noexcept { return vmaxvq_f32(v); }
+
+    bool allFinite() const noexcept
+    {
+        const uint32x4_t u = vreinterpretq_u32_f32(v);
+        const uint32x4_t expMask = vdupq_n_u32(0x7f800000u);
+        const uint32x4_t bad = vceqq_u32(vandq_u32(u, expMask), expMask);
+        return vmaxvq_u32(bad) == 0u;
+    }
 };
 
 VOC_INLINE V4 operator+(V4 a, V4 b) noexcept { return V4(vaddq_f32(a.v, b.v)); }
@@ -159,16 +170,100 @@ VOC_INLINE V4 fastExp2(V4 x) noexcept
     return V4(vreinterpretq_f32_s32(bits));
 }
 
-#else
+#elif VOC_SSE2
 
 struct Mask
 {
-    float m[4];
+    __m128 m;
 };
 
 struct V4
 {
-    float v[4];
+    __m128 v = _mm_setzero_ps();
+
+    V4() noexcept = default;
+    explicit V4(__m128 x) noexcept : v(x) {}
+
+    static V4 splat(float x) noexcept { return V4(_mm_set1_ps(x)); }
+
+    static V4 load(const float* p) noexcept { return V4(_mm_loadu_ps(p)); }
+
+    static V4 from(float a, float b, float c, float d) noexcept
+    {
+        return V4(_mm_set_ps(d, c, b, a));
+    }
+
+    void store(float* p) const noexcept { _mm_storeu_ps(p, v); }
+
+    float hsum() const noexcept
+    {
+        __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1));
+        __m128 sums = _mm_add_ps(v, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    }
+
+    float hmax() const noexcept
+    {
+        __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1));
+        __m128 maxs = _mm_max_ps(v, shuf);
+        shuf = _mm_movehl_ps(shuf, maxs);
+        maxs = _mm_max_ss(maxs, shuf);
+        return _mm_cvtss_f32(maxs);
+    }
+
+    bool allFinite() const noexcept
+    {
+        const __m128i u = _mm_castps_si128(v);
+        const __m128i expMask = _mm_set1_epi32(0x7f800000);
+        const __m128i bad = _mm_cmpeq_epi32(_mm_and_si128(u, expMask), expMask);
+        return _mm_movemask_epi8(bad) == 0;
+    }
+};
+
+VOC_INLINE V4 operator+(V4 a, V4 b) noexcept { return V4(_mm_add_ps(a.v, b.v)); }
+VOC_INLINE V4 operator-(V4 a, V4 b) noexcept { return V4(_mm_sub_ps(a.v, b.v)); }
+VOC_INLINE V4 operator*(V4 a, V4 b) noexcept { return V4(_mm_mul_ps(a.v, b.v)); }
+VOC_INLINE V4 operator/(V4 a, V4 b) noexcept { return V4(_mm_div_ps(a.v, b.v)); }
+
+VOC_INLINE V4 vmax(V4 a, V4 b) noexcept { return V4(_mm_max_ps(a.v, b.v)); }
+VOC_INLINE V4 vmin(V4 a, V4 b) noexcept { return V4(_mm_min_ps(a.v, b.v)); }
+VOC_INLINE V4 vsqrt(V4 a) noexcept { return V4(_mm_sqrt_ps(a.v)); }
+
+VOC_INLINE Mask vgt(V4 a, V4 b) noexcept { return Mask { _mm_cmpgt_ps(a.v, b.v) }; }
+VOC_INLINE Mask vlt(V4 a, V4 b) noexcept { return Mask { _mm_cmplt_ps(a.v, b.v) }; }
+VOC_INLINE Mask vge(V4 a, V4 b) noexcept { return Mask { _mm_cmpge_ps(a.v, b.v) }; }
+
+VOC_INLINE V4 vsel(Mask m, V4 a, V4 b) noexcept
+{
+    return V4(_mm_or_ps(_mm_and_ps(m.m, a.v), _mm_andnot_ps(m.m, b.v)));
+}
+
+VOC_INLINE V4 fastLog2(V4 x) noexcept
+{
+    alignas(16) float t[4];
+    x.store(t);
+    return V4::from(vocFastLog2(t[0]), vocFastLog2(t[1]), vocFastLog2(t[2]), vocFastLog2(t[3]));
+}
+
+VOC_INLINE V4 fastExp2(V4 x) noexcept
+{
+    alignas(16) float t[4];
+    x.store(t);
+    return V4::from(vocFastExp2(t[0]), vocFastExp2(t[1]), vocFastExp2(t[2]), vocFastExp2(t[3]));
+}
+
+#else
+
+struct Mask
+{
+    float m[4] = { 0.f, 0.f, 0.f, 0.f };
+};
+
+struct V4
+{
+    float v[4] = { 0.f, 0.f, 0.f, 0.f };
 
     static V4 splat(float x) noexcept { return V4 { { x, x, x, x } }; }
 
@@ -186,6 +281,18 @@ struct V4
 
     float hsum() const noexcept { return (v[0] + v[1]) + (v[2] + v[3]); }
     float hmax() const noexcept { return std::max(std::max(v[0], v[1]), std::max(v[2], v[3])); }
+
+    bool allFinite() const noexcept
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            uint32_t u = 0;
+            std::memcpy(&u, &v[i], 4);
+            if ((u & 0x7f800000u) == 0x7f800000u)
+                return false;
+        }
+        return true;
+    }
 };
 
 VOC_INLINE V4 operator+(V4 a, V4 b) noexcept
@@ -221,13 +328,13 @@ VOC_INLINE V4 vsqrt(V4 a) noexcept
 VOC_INLINE Mask vgt(V4 a, V4 b) noexcept
 {
     return Mask { { a.v[0] > b.v[0] ? 1.f : 0.f, a.v[1] > b.v[1] ? 1.f : 0.f,
-                     a.v[2] > b.v[2] ? 1.f : 0.f, a.v[3] > b.v[3] ? 1.f : 0.f } };
+                    a.v[2] > b.v[2] ? 1.f : 0.f, a.v[3] > b.v[3] ? 1.f : 0.f } };
 }
 VOC_INLINE Mask vlt(V4 a, V4 b) noexcept { return vgt(b, a); }
 VOC_INLINE Mask vge(V4 a, V4 b) noexcept
 {
     return Mask { { a.v[0] >= b.v[0] ? 1.f : 0.f, a.v[1] >= b.v[1] ? 1.f : 0.f,
-                     a.v[2] >= b.v[2] ? 1.f : 0.f, a.v[3] >= b.v[3] ? 1.f : 0.f } };
+                    a.v[2] >= b.v[2] ? 1.f : 0.f, a.v[3] >= b.v[3] ? 1.f : 0.f } };
 }
 VOC_INLINE V4 vsel(Mask m, V4 a, V4 b) noexcept
 {
@@ -247,6 +354,14 @@ VOC_INLINE V4 fastExp2(V4 x) noexcept
 
 #endif
 
+// Exponent-bit test. Immune to -ffast-math rewriting of (x == x) / std::isfinite.
+VOC_INLINE bool vocIsFinite(float x) noexcept
+{
+    uint32_t u = 0;
+    std::memcpy(&u, &x, 4);
+    return (u & 0x7f800000u) != 0x7f800000u;
+}
+
 VOC_INLINE float vocSanitize(float x) noexcept
 {
     uint32_t u = 0;
@@ -254,6 +369,8 @@ VOC_INLINE float vocSanitize(float x) noexcept
     if ((u & 0x7f800000u) == 0x7f800000u)
         return 0.f;
     if ((u & 0x7fffffffu) < 0x26800000u)
+        return 0.f;
+    if ((u & 0x7fffffffu) > 0x4cbebc20u) // |x| > 1.0e8f
         return 0.f;
     return x;
 }

@@ -3,16 +3,18 @@
 #include "Simd.h"
 
 #include <array>
+#include <cstring>
 
 // Channel vocoder. 40 bands are independent, so they are packed as 10
 // struct-of-arrays quads and filtered four-at-a-time. Each quad keeps its
 // SVF integrators in locals for a 32-sample sub-block (register-resident
 // on ARM64 NEON). Coefficients are rebuilt only when the smoothed design
-// or Formant actually moves.
+// or Formant actually moves, and all scratch buffers are preallocated.
 
 static constexpr int kVocMaxBands = 40;
 static constexpr int kVocQuads = 10;
 static constexpr int kVocSub = 32;
+static constexpr int kVocDesignFreqs = 36;
 
 struct VocoderParams
 {
@@ -41,6 +43,22 @@ struct VocoderParams
     float trackLow = 60.f;
     float trackHigh = 1000.f;
     bool deviceOn = true;
+
+    bool operator==(const VocoderParams& o) const noexcept
+    {
+        auto feq = [](float a, float b) noexcept { return std::memcmp(&a, &b, sizeof(float)) == 0; };
+        return carrier == o.carrier && bands == o.bands && feq(rangeLow, o.rangeLow)
+            && feq(rangeHigh, o.rangeHigh) && feq(bw, o.bw) && filterMode == o.filterMode
+            && feq(gateDb, o.gateDb) && feq(levelDb, o.levelDb) && feq(depth, o.depth)
+            && feq(attackMs, o.attackMs) && feq(releaseMs, o.releaseMs)
+            && feq(formantSt, o.formantSt) && feq(dryWet, o.dryWet)
+            && channels == o.channels && enhance == o.enhance
+            && feq(unvoicedDb, o.unvoicedDb) && feq(sens, o.sens) && uvSpeed == o.uvSpeed
+            && feq(noiseRate, o.noiseRate) && feq(noiseCrackle, o.noiseCrackle)
+            && oscWave == o.oscWave && oscPitch == o.oscPitch
+            && feq(trackLow, o.trackLow) && feq(trackHigh, o.trackHigh)
+            && deviceOn == o.deviceOn;
+    }
 };
 
 class VocoderEngine
@@ -54,6 +72,13 @@ public:
                  const VocoderParams& params,
                  const float attDb[kVocMaxBands],
                  float dispEnv[kVocMaxBands]);
+#if defined(VOC_ENABLE_TEST_HOOKS)
+    void debugInjectCorruptState(float val) noexcept
+    {
+        quads[0].sl2 = V4::splat(val);
+        quads[0].envR = V4::splat(val);
+    }
+#endif
 
 private:
     struct DesignKey
@@ -73,15 +98,16 @@ private:
 
     struct Band
     {
-        double logFc = 0, logFcT = 0;
-        double q = 1, qT = 1;
-        double retro = 1, retroT = 1;
-        double flat = 1, flatT = 1;
-        double invSqrtVr = 1;
-        double sign = 1;
-        double fc = 1000;
-        float a1 = 0, a2 = 0, a3 = 0, k = 1;
-        float sa1 = 0, sa2 = 0, sa3 = 0, sk = 1;
+        bool initialized = false;
+        double logFc = 6.907755278982137, logFcT = 6.907755278982137;
+        double q = 1.0, qT = 1.0;
+        double retro = 1.0, retroT = 1.0;
+        double flat = 1.0, flatT = 1.0;
+        double invSqrtVr = 1.0, invSqrtVrT = 1.0;
+        double sign = 1.0;
+        double fc = 1000.0;
+        float a1 = 0.f, a2 = 0.f, a3 = 0.f, k = 1.f;
+        float sa1 = 0.f, sa2 = 0.f, sa3 = 0.f, sk = 1.f;
     };
 
     struct Quad
@@ -101,13 +127,17 @@ private:
     };
 
     void designTargets();
-    void smoothCoeffs(int hostBlock, bool snap);
+    void smoothCoeffs(int stepSamples, bool snap);
     void packQuads();
     void updateActiveMask();
     void computeRunQuads();
     void clearSynthIC();
-    void clearAnalysisIC();
+    void clearAnalysisIC(bool clearEnvelopes);
+    void sanitizeFilterStates();
+    void clearBandLane(int band) noexcept;
+    void retireInactiveBands() noexcept;
     void resetPitchRing();
+    void updateDerivedParams(const VocoderParams& p, const float attDb[kVocMaxBands]);
 
     template <bool LR, bool UV>
     void analyzeSub(int m);
@@ -129,9 +159,22 @@ private:
     void publishDisp(float* disp) const;
 
     double sr = 48000.0;
+    double cachedSr = -1.0;
+    bool hasCachedParams = false;
+    VocoderParams cachedParams {};
+    std::array<float, kVocMaxBands> cachedAttDb {};
+
     int nBands = 20;
     int nRunQuads = 5;
+    int prevActiveBands = -1;
+    int designHoldSamples = 0;
+    bool designPending = false;
     bool boot = true;
+    bool coefSettling = true;
+    bool asleep = false;
+    bool devCleared = false;
+    int silenceHold = 0;
+    int silenceNeed = 2400;
     bool retro = false;
     float flo = 80.f;
     float fhi = 18000.f;
@@ -144,6 +187,9 @@ private:
     float nTrim = 1.f;
 
     int depthMode = 1;
+    float depthTarget = 100.f;
+    float depthSm = 100.f;
+    float depthBlend = 1.f;
     float depthK = 1.f;
     bool gateOff = true;
     float gateOpenTh = 0.f;
@@ -212,6 +258,15 @@ private:
     std::array<float, 4096> ybuf {};
     std::array<float, 2048> yinD {};
 
+    // Preallocated solver scratch (zero heap allocations on audio thread)
+    std::array<double, kVocDesignFreqs * kVocMaxBands> solveHR {};
+    std::array<double, kVocDesignFreqs * kVocMaxBands> solveHI {};
+    std::array<double, kVocMaxBands> solveG {};
+    std::array<double, kVocDesignFreqs> solveSR {};
+    std::array<double, kVocDesignFreqs> solveSI {};
+    std::array<double, kVocDesignFreqs> solveMag {};
+    std::array<double, kVocDesignFreqs> solveTmp {};
+
     std::array<Band, kVocMaxBands> bands {};
     std::array<Quad, kVocQuads> quads {};
 
@@ -231,14 +286,14 @@ private:
     float eAll[kVocSub] {};
     float eHi[kVocSub] {};
 
-    V4 envHistL[kVocQuads][kVocSub];
-    V4 envHistR[kVocQuads][kVocSub];
-    V4 wHistL[kVocQuads][kVocSub];
-    V4 wHistR[kVocQuads][kVocSub];
-    V4 gHistL[kVocQuads][kVocSub];
-    V4 gHistR[kVocQuads][kVocSub];
-    V4 bpHistL[kVocQuads][kVocSub];
-    V4 bpHistR[kVocQuads][kVocSub];
-    V4 rmsHistL[kVocQuads][kVocSub];
-    V4 rmsHistR[kVocQuads][kVocSub];
+    V4 envHistL[kVocQuads][kVocSub] {};
+    V4 envHistR[kVocQuads][kVocSub] {};
+    V4 wHistL[kVocQuads][kVocSub] {};
+    V4 wHistR[kVocQuads][kVocSub] {};
+    V4 gHistL[kVocQuads][kVocSub] {};
+    V4 gHistR[kVocQuads][kVocSub] {};
+    V4 bpHistL[kVocQuads][kVocSub] {};
+    V4 bpHistR[kVocQuads][kVocSub] {};
+    V4 rmsHistL[kVocQuads][kVocSub] {};
+    V4 rmsHistR[kVocQuads][kVocSub] {};
 };

@@ -61,18 +61,52 @@ public:
 
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
+    void reset() override;
 
     void setBandAttDb(int index, float db);
     float getBandAttDb(int index) const;
     void resetAllBands();
+#if defined(VOC_ENABLE_TEST_HOOKS)
+    void debugInjectCorruptState(float val) noexcept { engine.debugInjectCorruptState(val); }
+#endif
 
     juce::AudioProcessorValueTreeState apvts;
     std::atomic<float> bandAttDb[kVocMaxBands];
     std::atomic<float> dispEnv[kVocMaxBands];
+    std::atomic<uint32_t> stateRevision { 1 };
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
-    VocoderParams readParams() const;
+    VocoderParams readParams() const noexcept;
+
+    struct ParamPtrs
+    {
+        std::atomic<float>* carrier = nullptr;
+        std::atomic<float>* bands = nullptr;
+        std::atomic<float>* rangeLow = nullptr;
+        std::atomic<float>* rangeHigh = nullptr;
+        std::atomic<float>* bw = nullptr;
+        std::atomic<float>* filterMode = nullptr;
+        std::atomic<float>* gate = nullptr;
+        std::atomic<float>* level = nullptr;
+        std::atomic<float>* depth = nullptr;
+        std::atomic<float>* attack = nullptr;
+        std::atomic<float>* release = nullptr;
+        std::atomic<float>* formant = nullptr;
+        std::atomic<float>* dryWet = nullptr;
+        std::atomic<float>* channels = nullptr;
+        std::atomic<float>* enhance = nullptr;
+        std::atomic<float>* unvoiced = nullptr;
+        std::atomic<float>* sens = nullptr;
+        std::atomic<float>* uvSpeed = nullptr;
+        std::atomic<float>* noiseRate = nullptr;
+        std::atomic<float>* noiseCrackle = nullptr;
+        std::atomic<float>* oscWave = nullptr;
+        std::atomic<float>* oscPitch = nullptr;
+        std::atomic<float>* trackLow = nullptr;
+        std::atomic<float>* trackHigh = nullptr;
+        std::atomic<float>* deviceOn = nullptr;
+    } paramPtrs;
 
     VocoderEngine engine;
 
