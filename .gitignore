@@ -6,3 +6,5 @@ tests/signals/
 __pycache__/
 *.pyc
 .DS_Store
+juce/build/
+juce/third_party/
